@@ -3,7 +3,7 @@ Unlike 16S rRNA amplicons, shotgun metagenomics targets all DNA present in the s
 All these steps were done using [ATLAS](https://github.com/metagenome-atlas/atlas) Snakmake workflow and the resultant was analysed as demostrated in this [R markdown](https://github.com/farhadm1990/Shotgun-metagenomics/blob/main/Megagenomics%20analysis%20of%20DSS%20and%20B.%20pilosicoli.Rmd). 
 
 ## 2.2. Removing singletones based on abundance
-```{r}
+```r
 #A function to find singletones. You need to be careful about this step!
 out.ASV = function(phyloseq, threshold =1, binwidth = 0.01) {
   
