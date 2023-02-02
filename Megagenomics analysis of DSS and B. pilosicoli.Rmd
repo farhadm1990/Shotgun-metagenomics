@@ -1,0 +1,3135 @@
+---
+title: "Metagenoics analysis"
+author: "Farhad"
+date: "2023-01-28"
+output:
+  pdf_document: default
+  html_document: default
+header-includes:
+  - |
+    ```{=latex}
+    \usepackage{fvextra}
+    \DefineVerbatimEnvironment{Highlighting}{Verbatim}{
+      breaksymbolleft={}, 
+      showspaces = false,
+      showtabs = false,
+      breaklines,
+      commandchars=\\\{\}
+    }
+    ```
+---
+# In this workflow the main steps for analysis of shotgun metagnoics data are presented. This sheet is related to the manuscript titled "Functional profile and composition of colonic microbiome in a pig model for colitis-complex diarrrhea".
+
+
+```{r, setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE, 
+                      message = FALSE,
+                      warning = FALSE, 
+                      cache = FALSE, include = TRUE, tidy.opts = list(width.cutoff = 60), tidy = "styler")
+
+
+```
+
+# 1. Loading libraries 
+
+```{r, libraries,include=FALSE}
+library(plotly)
+library(heatmaply) 
+library(readr)
+library(stringr)
+library(pheatmap)
+library(microbiome)
+library(ape)
+library(tidyverse)
+library(vegan)
+library(ggtree)
+library("httpgd")
+hgd()
+```
+
+````{r, eval = FALSE}
+setwd("../../in vivo model/Rhub")
+load("./invivo.RData")
+
+save.image("./invivo.RData")
+
+
+```
+
+## File directories
+```{r, file_paths}
+atlas_wd_folder = "./metagenome/"
+
+taxonomy_file = paste0(atlas_wd_folder,"genomes/taxonomy/gtdb_taxonomy.tsv")
+tree_file = paste0(atlas_wd_folder,"genomes/tree/gtdbtk.bac120.nwk")
+quality_file= paste0(atlas_wd_folder,"genomes/checkm/completeness.tsv")
+counts_file= paste0(atlas_wd_folder,"genomes/counts/raw_counts_genomes.tsv")
+abundance_file = paste0(atlas_wd_folder,"genomes/counts/median_coverage_genomes.tsv")
+readstats_file= paste0(atlas_wd_folder,"genomes/stats/read_counts.tsv")
+keggmodules_file = paste0(atlas_wd_folder,"genomes/annotations/dram/kegg_modules.tsv")
+
+```
+
+## Gloomer: a costumized function as a wrapper for tax_glom() for tidy unique names of agglomerated taxa
+```{r}
+# Gloomer
+
+#A function to create unique names for each ASV. It removes any NA in Order level then attempts to use the name of one level higher taxa for those 
+#who have similar names, e.g. uncultured_bacterium
+
+gloomer = function(ps = data, taxa_level = taxa_level, NArm = "TRUE"){
+    rank.names = c('Kingdom','Phylum', 'Class', 'Order', 'Family', 'Genus', 'Species')
+    
+
+#====================Sometimes in genus level, we might have multiple uncultured organisms, which if we want to make unique out of them for the species level it won't work====
+    #since adding uncultured to uncultered is sill duplication. therefore if the taxa_level is set to species we first make a unique genus and then we go further to the speices===#
+
+#Removing unculured Family
+ps = subset_taxa(ps, !Family %in% c("uncultured", "NA", "uncategorized", "unassigend", "", " "))
+    
+if(taxa_level == "Species") {
+
+    ps = subset_taxa(ps, !Genus %in% NA)#we remove genus tagged NA
+tax_table(ps)[, taxa_level] <- ifelse(is.na(tax_table(ps)[, taxa_level]), paste0("unknown"), paste(tax_table(ps)[, taxa_level]))#convert NA in species into unknown
+    
+  physeq = tax_glom(physeq = ps, taxrank = taxa_level, NArm = NArm)
+  taxdat = tax_table(physeq)[, seq_along(rank.names[1:which(rank.names == taxa_level)])]
+
+   taxdat = taxdat[complete.cases(taxdat),] %>% as.data.frame
+    otudat = otu_table(physeq)
+   
+#first take care of the uncultured genus
+taxdat[,6] = ifelse(taxdat[,6] %in% c("uncategorized", NA, "uncultured", "unassigend", "", " "),
+       paste0("[", taxdat[,length(rank.names[1:which(rank.names=="Genus")])-1], "]", "_", taxdat[,6]), taxdat[,6])
+    
+spec1 = taxdat[, taxa_level] %>% as.vector
+spec2  = taxdat[, taxa_level] %>% as.vector
+
+    uni  = matrix(NA, ncol = length(spec2), nrow = length(spec1))
+    for(i in seq_along(spec1)){
+        for(j in seq_along(spec2)){
+    uni[i, j] = ifelse(spec1[i] == spec2[j] , "TRUE", "FALSE")
+    }
+        }
+
+rownames(uni) <-spec1
+colnames(uni) <- spec2   
+uni[upper.tri(uni, diag = TRUE)] = 0 #get rid of diagonals and upper triangle
+
+duplis = uni %>% reshape2::melt() %>% filter(value == "TRUE") 
+
+if(dim(duplis)[[1]] > 0) {
+duplis = uni %>% reshape2::melt() %>% filter(value == "TRUE") %>% dplyr::select(1) %>% unique() %>% unlist %>% as.vector
+taxdat = taxdat %>% mutate( uni= ifelse(taxdat[, taxa_level] %in% duplis,
+                    paste0("[", taxdat[,length(rank.names[1:which(rank.names==taxa_level)])-1], "]", "_", taxdat[,taxa_level]), taxdat[,taxa_level]))
+
+#check if all the names are unique at species level, otherwise we will bring family instead of genus
+   dupies <-  taxdat[duplicated(taxdat[,"uni"]), "uni"] 
+    if(length(dupies)>0) {
+        taxdat = taxdat %>% data.frame %>% mutate( uni2= ifelse(taxdat[, "uni"] %in% dupies,
+                    paste0("[", taxdat[,length(rank.names[1:which(rank.names==taxa_level)])-2], "]", "_", taxdat[,"uni"]), taxdat[,"uni"]))
+        
+        taxdat[, taxa_level] = taxdat[, "uni2"]
+        taxdat[, "uni"] <- NULL
+        taxdat[, "uni2"] <- NULL
+        taxdat <- as(taxdat, "matrix")   
+        rownames(otudat) <- taxdat[rownames(taxdat) %in% rownames(otudat), taxa_level]
+        rownames(taxdat) <- taxdat[, taxa_level]
+        taxdat <- tax_table(taxdat)
+        taxa_names(physeq) <- taxa_names(taxdat)
+        tax_table(physeq) <- taxdat
+        otu_table(physeq) <- otudat
+        
+    }
+    else 
+    {
+        
+taxdat[, taxa_level] = taxdat[, "uni"]
+taxdat[, "uni"] <- NULL
+taxdat <- as(taxdat, "matrix")   
+rownames(otudat) <- taxdat[rownames(taxdat) %in% rownames(otudat), taxa_level]
+rownames(taxdat) <- taxdat[, taxa_level]
+taxdat <- tax_table(taxdat)
+taxa_names(physeq) <- taxa_names(taxdat)
+tax_table(physeq) <- taxdat
+otu_table(physeq) <- otudat
+           }
+    
+} else {
+    
+taxdat <- as.matrix(taxdat) 
+taxdat <- tax_table(taxdat)
+rownames(otudat) <- taxdat[rownames(taxdat) %in% rownames(otudat), taxa_level]
+rownames(taxdat) <- taxdat[, taxa_level]
+taxdat <- tax_table(taxdat)
+taxa_names(physeq) <- taxa_names(taxdat)
+tax_table(physeq) <- taxdat
+otu_table(physeq) <- otudat
+    
+}
+       
+    
+#==========================================# 
+} else if (taxa_level == "Genus") {
+    
+    physeq = tax_glom(physeq = ps, taxrank = taxa_level, NArm = NArm)
+    taxdat = tax_table(physeq)[, seq_along(rank.names[1:which(rank.names == taxa_level)])]
+    
+   taxdat = taxdat[complete.cases(taxdat),] %>% as.data.frame
+    otudat = otu_table(physeq)
+    
+# take care of the uncultured genus
+taxdat[,6] = ifelse(taxdat[,6] %in% c("uncategorized", NA, "uncultured", "unassigend", "", " "),
+       paste0("[", taxdat[,length(rank.names[1:which(rank.names==taxa_level)])-1], "]", "_", taxdat[,taxa_level]), taxdat[,taxa_level])
+    
+gen1 = taxdat[, taxa_level] %>% as.vector
+gen2  = taxdat[, taxa_level] %>% as.vector
+
+    uni  = matrix(NA, ncol = length(gen2), nrow = length(gen1))
+    for(i in seq_along(gen1)){
+        for(j in seq_along(gen2)){
+    uni[i, j] = ifelse(gen1[i] == gen2[j] , "TRUE", "FALSE")
+    }
+        }
+
+rownames(uni) <-gen1
+colnames(uni) <- gen2   
+uni[upper.tri(uni, diag = TRUE)] = 0 #get rid of diagonals and upper triangle
+
+duplis = uni %>% reshape2::melt() %>% filter(value == "TRUE")
+
+        if(dim(duplis)[[1]] > 0){#if there is not duplications, we can simply use the taxa names as the row name
+    
+        duplis = uni %>% reshape2::melt() %>% filter(value == "TRUE") %>% dplyr::select(1)%>% unique() %>% unlist %>% as.vector
+        taxdat = taxdat %>% mutate( uni= ifelse(taxdat[, taxa_level] %in% duplis, 
+                    paste0("[", taxdat[,length(rank.names[1:which(rank.names==taxa_level)])-1], "]", "_", taxdat[,taxa_level]), taxdat[,taxa_level]))
+    
+        taxdat[, taxa_level] = taxdat[, "uni"]
+        taxdat[, "uni"] <- NULL
+
+        taxdat <- as(taxdat, "matrix")
+ 
+        rownames(otudat) <- taxdat[rownames(taxdat) %in% rownames(otudat), taxa_level]
+        rownames(taxdat) <- taxdat[taxdat[,taxa_level] %in% rownames(otudat), taxa_level]
+        taxdat <- as.matrix(taxdat) 
+        taxdat <- tax_table(taxdat)
+        taxa_names(physeq) <- taxa_names(taxdat)
+        tax_table(physeq) <- taxdat
+        otu_table(physeq) <- otudat
+ 
+        } else {
+
+        taxdat <- as.matrix(taxdat) 
+        taxdat <- tax_table(taxdat)
+        rownames(otudat) <- taxdat[rownames(taxdat) %in% rownames(otudat), taxa_level]
+        rownames(taxdat) <- taxdat[, taxa_level]
+        taxdat <- tax_table(taxdat)
+        taxa_names(physeq) <- taxa_names(taxdat)
+        tax_table(physeq) <- taxdat
+        otu_table(physeq) <- otudat
+       }   
+    
+} else {
+    
+    
+physeq = tax_glom(physeq = ps, taxrank = taxa_level, NArm = TRUE)
+    taxdat = tax_table(physeq)[, seq_along(rank.names[1:which(rank.names == taxa_level)])]
+    
+taxdat = taxdat[complete.cases(taxdat),] %>% as.data.frame
+otudat = otu_table(physeq)
+    
+spec1 = taxdat[, taxa_level] %>% as.vector
+spec2  = taxdat[, taxa_level] %>% as.vector
+
+    uni  = matrix(NA, ncol = length(spec2), nrow = length(spec1))
+    for(i in seq_along(spec1)){
+        for(j in seq_along(spec2)){
+    uni[i, j] = ifelse(spec1[i] == spec2[j] , "TRUE", "FALSE")
+    }
+        }
+
+rownames(uni) <-spec1
+colnames(uni) <- spec2   
+uni[upper.tri(uni, diag = TRUE)] = 0 #get rid of diagonals and upper triangle
+
+duplis = uni %>% reshape2::melt() %>% filter(value == "TRUE")
+
+if(dim(duplis)[[1]] > 0){#if there is not duplications, we can simply use the taxa names as the row name
+    
+    duplis = uni %>% reshape2::melt() %>% filter(value == "TRUE") %>% dplyr::select(1)%>% unique() %>% unlist %>% as.vector
+taxdat = taxdat %>% mutate( uni= ifelse(taxdat[, taxa_level] %in% duplis, 
+                    paste(taxdat[,length(rank.names[1:which(rank.names==taxa_level)])-1], "_", taxdat[,taxa_level]), taxdat[,taxa_level]))
+    
+taxdat[, taxa_level] = taxdat[, "uni"]
+taxdat[, "uni"] <- NULL
+taxdat <- as.matrix(taxdat)   
+rownames(otudat) <- taxdat[rownames(taxdat) %in% rownames(otudat), taxa_level]
+rownames(taxdat) <- taxdat[, taxa_level]
+taxdat <- tax_table(taxdat)
+taxa_names(physeq) <- taxa_names(taxdat)
+tax_table(physeq) <- taxdat
+otu_table(physeq) <- otudat
+} else {
+
+taxdat <- as.matrix(taxdat) 
+taxdat <- tax_table(taxdat)
+rownames(otudat) <- taxdat[rownames(taxdat) %in% rownames(otudat), taxa_level]
+rownames(taxdat) <- taxdat[, taxa_level]
+taxdat <- tax_table(taxdat)
+taxa_names(physeq) <- taxa_names(taxdat)
+tax_table(physeq) <- taxdat
+otu_table(physeq) <- otudat
+}
+#ps = phyloseq(otu_table(otudat, taxa_are_rows = T), tax_table(as.matrix(taxdat)), sample_data(physeq))
+ 
+
+}
+return(physeq) 
+    }
+    
+
+    
+  
+
+
+```
+
+# 2. Importing data
+```{r, metadata, abundance file, taxonomy and tree}
+#  metadata
+metadata <- readxl::read_xlsx("./metadata.invivo.xlsx", sheet = 1) %>% data.frame() %>% column_to_rownames("sample.id")
+
+metadata$treatment <- factor(metadata$treatment, levels = c("CT", "BP", "DSS", "DSSBP"))
+cols <- colnames(metadata)[1:5]
+
+for(i in 1:length(cols)){
+  metadata[[i]] <- as.factor(metadata[[i]])
+}
+
+# count table
+abund.df <- read_tsv(abundance_file, show_col_types =  FALSE) %>%
+column_to_rownames("...1") %>% t() %>% round()
+
+#taxonomy
+Tax <- read_tsv(taxonomy_file, show_col_types = FALSE)
+
+## create a short label for each species
+taxonomy <- Tax %>%
+  mutate(Label = ifelse(is.na(species) & is.na(genus), paste0(family, " ", user_genome), species)) %>%
+  mutate(Label = ifelse(is.na(Label), paste0(genus, " ", user_genome), Label))
+
+##there was a misspelling in Firmicutes and Desulfobacterota
+taxonomy$phylum <- ifelse(taxonomy$phylum == "Firmicutes_A", "Firmicutes", 
+ifelse(taxonomy$phylum == "Firmicutes_C", "Firmicutes", 
+ifelse(taxonomy$phylum == "Firmicutes", "Firmicutes", taxonomy$phylum)))
+
+taxa <- taxonomy %>% select(-Label) %>% column_to_rownames("user_genome") %>% as.matrix()
+colnames(taxa) <- c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+
+
+#in genus level there is _ for the same taxa but with different letter annotation. I remove it as follows
+
+gens <- matrix(NA, ncol = 1, nrow= nrow(taxa), dimnames = list(rownames(taxa), "genus"))
+
+for(i in 1:nrow(gens)){
+
+ gens[i, ] <- ifelse(grepl(as.character(taxa[i,6]), pattern = "_"), substr(taxa[i,6], start = 1, stop = nchar(taxa[i,6])-2), taxa[i,6])
+
+}
+
+taxa[,6] <- gens[rownames(gens) %in% rownames(taxa), 1]
+
+## the same problem in species, first we split them into two parts and then remove the _LETTER from the first part and paste them together. 
+
+spec.split <- str_split_fixed(taxa[,7], pattern = " ", n = 2)
+rownames(spec.split) <- rownames(taxa)
+
+spec <- matrix(NA, ncol = 1, nrow= nrow(spec.split), dimnames = list(rownames(taxa), "species"))
+
+for(i in 1:nrow(spec)){
+
+ spec[i, ] <- ifelse(grepl(as.character(spec.split[i,1]), pattern = "_"), substr(spec.split[i,1], start = 1, stop = nchar(spec.split[i,1])-2), spec.split[i,1])
+
+}
+
+spec.split[,1] <- spec[rownames(spec) %in% rownames(taxa), 1]
+
+#the same for the other half
+spec <- matrix(NA, ncol = 1, nrow= nrow(spec.split), dimnames = list(rownames(taxa), "species"))
+
+for(i in 1:nrow(spec)){
+
+ spec[i, ] <- ifelse(grepl(as.character(spec.split[i,2]), pattern = "_"), substr(spec.split[i,2], start = 1, stop = nchar(spec.split[i,2])-2), spec.split[i,2])
+
+}
+
+spec.split[,2] <- spec[rownames(spec) %in% rownames(taxa), 1]
+
+spec = paste(spec.split[,1], spec.split[,2]) %>% as.matrix()
+rownames(spec) <- rownames(taxa)
+
+taxa[, 7] <- spec[rownames(spec) %in% rownames(taxa),1]
+
+#for Order
+taxa[, 4] <- ifelse(taxa[,4] == "Haloplasmatales_A", "Haloplasmatales", taxa[,4])
+
+taxa[taxa== " "] <- NA
+
+#Tree
+T <- ggtree::read.tree(tree_file)
+
+
+#phyloseq
+
+pst <- phyloseq(sample_data(metadata), otu_table(abund.df, taxa_are_rows = TRUE), tax_table(taxa), phy_tree(T))
+
+
+```
+
+
+# 2. Preprocessing
+## 2.1. filtering taxa based on prevalence
+```{r}
+asv.filter = function(asvtab, n.samples = 3){ # nolint
+  filter.threshold <- n.samples/ncol(asvtab) * 100 # nolint
+  table_count <- apply(asvtab, 2, function(x) ifelse(x>0, 1, 0)) %>% as.data.frame()
+  suspected_ASV = table_count[which((rowSums(table_count)/ncol(table_count))*100 < filter.threshold),] %>% rownames()
+  
+  return(suspected_ASV)
+}
+
+
+
+suspected_ASV = asv.filter(asvtab = otu_table(pst), n.samples = 1.1)  #taxa in less than 5% of samples will be removed 
+
+pst.count = subset_taxa(pst, !taxa_names(pst)%in% suspected_ASV)
+
+rm(suspected_ASV)
+
+
+```
+
+## 2.2. Removing singletones based on abundance
+```{r}
+#A function to find singletones. You need to be careful about this step!
+out.ASV = function(phyloseq, threshold =1, binwidth = 0.01) {
+  
+#Loading necessary pkgs      
+  pacman::p_load(glue, tidyverse, reshape2, ggrepel, S4Vectors) # nolint
+#This function requires phyloseq, tidyverse and glue packages to be loaded. 
+    if (sum(colSums(otu_table(phyloseq)))/ncol(otu_table(phyloseq)) == 100 ) {#making the relative abundance table
+                    rel_abund = as(t(otu_table(phyloseq)), "matrix")
+    } else if (sum(colSums(otu_table(phyloseq)))/ncol(otu_table(phyloseq)) == 1) {
+                    rel_abund = as(t(otu_table(phyloseq)), "matrix")
+                    } else {
+                    rel_abund = as(t(apply(otu_table(phyloseq), 
+                    ifelse(taxa_are_rows(phyloseq), 1,2), 
+                    function(x) x/sum(x))), "matrix")  
+                    } 
+                      
+                      
+                      names.single = apply(rel_abund, 1, function(x){ifelse(x == threshold, TRUE, ifelse(x == sum(x),
+                      TRUE, FALSE))}) %>% reshape2::melt() %>% filter(value == TRUE) %>% dplyr::select(2) %>%
+                      pull   %>% as.vector()
+                      
+                        
+                        if (length(names.single) == 0 ) {
+                        print(glue("WOW! {length(names.single)} singletones detected in this dataset"))
+                        qplot.noSing = qplot(rel_abund, geom = "histogram", binwidth = binwidth, 
+                        show.legend = F, main = "Frequency count of relative abundance, no singletones detected") +
+                        xlab ("Relative abundance in samples") + ylab("Frequency") + theme_bw()
+                            
+                        
+                        return(structure(list(qplot.noSing)))
+                            
+                        } else { 
+                             
+                       single.ASV = rel_abund[rownames(rel_abund) %in% names.single,]
+                       single.ASV[single.ASV == 0] <- NA # A separate dataset for annotation of singletones on the barplot
+                            
+                       qplot.withSing = qplot(rel_abund, geom = "histogram", binwidth = binwidth, 
+                       main = "Frequency count of relative abundance with singletones") +
+                       geom_bar(aes(single.ASV), fill = "red",  color = NA, width = binwidth)+
+                       xlab ("Relative abundance in samples") + ylab("Frequency") + 
+                       geom_label_repel(aes(x = 1, y =length(rel_abund)/5), 
+                       label.padding =  unit(0.55, "lines"), 
+                       label = glue("{length(names.single)}\n Singletones"), color = "black") + theme_bw()
+                            
+                       qplot.rmSing = qplot(rel_abund[!rownames(rel_abund) %in% names.single, ], geom = "histogram",
+                       binwidth = binwidth, main = "Frequency count of relative abundance without singletones") +
+                       xlab ("Relative abundance in samples") + ylab("Frequency")+ theme_bw()
+                            
+                       print(glue('Oh no..! {length(names.single)} singletones detected in the dataset'))
+                       return(structure(list(qplot.withSing, qplot.rmSing, unlist(names.single))) )
+                    
+                        }                        
+    
+                             
+        }
+                        
+single.test = out.ASV(phyloseq = pst.count, threshold = 1, binwidth = 0.1)
+#singletones = single.test[[3]] #here you can extract the names of the singletones
+
+single.test[[1]]#to show the plot with singletones
+#single.test[[2]]#to show the plot without singletones
+
+#Now you can remove the singletones from your pst file as follows:
+#pst.no.single = subset_taxa(ps, !taxa_names(ps)%in% singletones)
+#ps = pst.no.single
+
+rm(single.test)
+```
+
+
+
+## 2.3. Relative abundance of taxa
+### For the relative abundance, we take the coverage over the genome, not the raw counts. This implicitly normalizes for genome size. The coverage is calculated as the median of the coverage values calculated in 1kb blocks.
+
+```{r, relative_abund}
+# calculate relative abundance
+rel_ab <- apply(pst.count@otu_table, 2, function(x){x/sum(x)})
+rel_ab <- t(rel_ab)
+taxa = taxa %>% data.frame() %>% rownames_to_column("Sample")
+# get most abundant genomes
+counts_per_genome <- data.frame(sums = colSums(rel_ab)) %>%
+  rownames_to_column(var = "Sample") %>%
+  left_join(taxa, by = "Sample" ) %>%
+  arrange(desc(sums))
+
+
+ggplot(counts_per_genome %>%
+         top_n(sums, n = 10), aes(x = reorder(Species, -sums), fill = Phylum, y = sums)) +
+  geom_col() +
+  labs(x = "", y = "Abundance [rel_ab]", title = "Most abundant genomes") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+### 2.4. Bar chart for phylum
+```{r, barplot phylum}
+library(RColorBrewer)
+
+
+glom.phyl <- gloomer(pst.count, "Phylum", NArm = TRUE)
+
+#using merge_samples
+trans.ps1 <- merge_samples(glom.phyl, "treatment") 
+trans.ps1 <- transform_sample_counts(trans.ps1, function(x){x/sum(x)*100})
+
+sample_data(trans.ps1)$treatment <- rownames(sample_data(trans.ps1)) %>% factor(levels = c('CT', 'BP', 'DSS', 'DSSBP'))
+
+#using psmelt
+ps.rel <- transform_sample_counts(glom.phyl, function(x){x/sum(x)*100})
+trans.ps3 <- psmelt(ps.rel) %>%
+dplyr::select(Abundance, treatment, 
+Phylum, Sample) %>% group_by(Phylum, treatment) %>%
+summarise(rel_abund = mean(Abundance), .groups = "drop") 
+
+
+
+#color index
+
+
+phylcol=c('coral4', "darkorange",'antiquewhite4','gold', 
+'cornflowerblue', 'plum4',
+'darkgoldenrod3','aquamarine4', 
+'cadetblue2', 'darkgreen', 
+'red','Gray',
+'steelblue2','darkmagenta',
+"orchid2", "goldenrod" , "lightcoral")
+
+
+set.seed(1)
+phylcol = sample(phylcol, 11, F)
+cols = data.frame(Phylum = unique(trans.ps1@tax_table[,2]),
+fill = phylcol) %>% as.matrix
+rownames(cols) <- cols[,1]
+
+plot_bar(trans.ps1, fill="Phylum", x = "treatment") + 
+scale_fill_manual(values = cols[rownames(cols) %in% trans.ps1@tax_table[,2],2]) + 
+xlab("Treatments") + 
+ylab("Relative abundance") + 
+geom_col(color  = "black")+
+scale_y_continuous(labels = function(x) format(x, scientific = FALSE))+#to print the scale in scientific notation
+theme_bw() + 
+theme(text = element_text(size =15, face = "bold"))
+
+ggsave("./outputs/barplot.phyla.jpeg", dpi = 300, width = 7, height = 10)
+
+#this method also gives the same results. do as you whish
+
+color.index <- c("#771155", "#AA4488", "#CC99BB", "#114477", "#4477AA", "#77AADD", "#117777", "#44AAAA", "#77CCCC", "#117744", "#44AA77", "#88CCAA", "#777711", "#AAAA44", "#DDDD77", "#774411", "#AA7744", "#DDAA77", "#771122", "#AA4455", "#DD7788")
+cols <- as.vector(c(color.index, phylcol))
+
+set.seed(12);trans.ps3 %>% 
+ggplot(aes(x= treatment, y = rel_abund, fill = Phylum)) + 
+  geom_bar(stat = "identity",
+           position = "stack", color ="black", lwd = 0.1) +
+  theme_bw() + 
+  ylab("Relative abundance") + 
+  xlab("")+
+  scale_fill_manual(values = sample(cols, size = 11, replace = FALSE))+
+  ggtitle("Phylum")+ 
+  theme(axis.text.x = element_text(face = "bold", size =12), 
+  text = element_text(size = 15, face = "bold")) +
+  scale_y_continuous(n.breaks = 6) 
+
+
+
+rm(glom.phyl, trans.ps1, trans.ps3, phylcol, cols, color.index)
+```
+
+## 2.5. Bar chart for genus
+```{r, barplot genus}
+
+
+
+glom.gen <- gloomer(pst.count, "Genus", NArm = TRUE)
+
+#using psmelt
+ps.rel <- transform_sample_counts(glom.gen, function(x){x/sum(x)*100})
+trans.ps <- psmelt(ps.rel) %>%
+dplyr::select(Abundance, treatment, Family,
+Genus, Order, Sample, Phylum) %>% group_by(Genus, Family, Phylum, Order, treatment) %>%
+summarise(rel_abund = mean(Abundance), .groups = "drop") 
+
+
+trans.ps %>%
+ggplot(aes(x = treatment, y = rel_abund, fill = Genus)) + 
+geom_bar(stat = "identity", color = "black")
+
+#color index
+color.index <- c("#771155", "#AA4488", "#CC99BB", "#114477", "#4477AA", "#77AADD", "#117777", "#44AAAA", "#77CCCC", "#117744", "#44AA77", "#88CCAA", "#777711", "#AAAA44", "#DDDD77", "#774411", "#AA7744", "#DDAA77", "#771122", "#AA4455", "#DD7788")
+
+set.seed(24)
+
+col.pal <- function(df, group, subgroup){
+
+  # Find how many colour categories to create and the number of colours in each
+  categories <- aggregate(as.formula(paste(subgroup, group, sep="~" )), df, function(x) length(unique(x)))
+  category.start <- (scales::hue_pal(l = 100)(nrow(categories))) # Set the top of the colour pallete
+  category.end  <- (scales::hue_pal(l = 15)(nrow(categories))) # set the bottom
+
+  # Build Colour pallette
+  colours <- unlist(lapply(1:nrow(categories),
+                          function(i){
+                            colorRampPalette(colors = c(category.start[i], category.end[i]))(categories[i,2])}))
+  return(colours)
+}
+
+
+colies = col.pal(trans.ps, "Phylum", "Genus")
+
+
+
+trans.ps %>% 
+ggplot(aes(x= treatment, y = rel_abund, fill = Genus)) + 
+  geom_bar(stat = "identity",
+           position = "stack",  show.legend = TRUE) +
+  theme_bw() + 
+  ylab("Relative abundance of different genera") + 
+  xlab("")+
+#scale_fill_manual(values = colies)+
+  scale_fill_viridis(discrete = TRUE) +
+  ggtitle("Genus")+ 
+  theme(axis.text.x = element_text(face = "bold", size =12), 
+  text = element_text(size = 15, face = "bold")) +
+  scale_y_continuous(n.breaks = 6) +
+  guides(fill = guide_legend(ncol = 1))
+
+ggsave("./outputs/bars_box/barplot.genus.genus.jpeg", dpi = 300, width = 7, height = 10)
+```
+
+
+
+
+## 2.6. Genome quality
+
+```{r, read_genome_quality}
+
+Tax = Tax <- read_tsv(taxonomy_file, show_col_types = FALSE)
+
+taxonomy <- Tax %>%
+  mutate(Label = ifelse(is.na(species) & is.na(genus), paste0(family, " ", user_genome), species)) %>%
+  mutate(Label = ifelse(is.na(Label), paste0(genus, " ", user_genome), Label))
+
+##there was a misspelling in Firmicutes and Desulfobacterota
+taxonomy$phylum <- ifelse(taxonomy$phylum == "Firmicutes_A", "Firmicutes", 
+ifelse(taxonomy$phylum == "Firmicutes_C", "Firmicutes", 
+ifelse(taxonomy$phylum == "Firmicutes", "Firmicutes", taxonomy$phylum)))
+
+taxa <- taxonomy  %>% column_to_rownames("user_genome") %>% as.matrix()
+colnames(taxa) <- c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species", "Label")
+colnames(taxa)
+
+#in genus level there is _ for the same taxa but with different letter annotation. I remove it as follows
+
+gens <- matrix(NA, ncol = 1, nrow= nrow(taxa), dimnames = list(rownames(taxa), "genus"))
+
+for(i in 1:nrow(gens)){
+
+ gens[i, ] <- ifelse(grepl(as.character(taxa[i,6]), pattern = "_"), substr(taxa[i,6], start = 1, stop = nchar(taxa[i,6])-2), taxa[i,6])
+
+}
+
+taxa[,6] <- gens[rownames(gens) %in% rownames(taxa), 1]
+
+## the same problem in species, first we split them into two parts and then remove the _LETTER from the first part and paste them together. 
+
+spec.split <- str_split_fixed(taxa[,7], pattern = " ", n = 2)
+rownames(spec.split) <- rownames(taxa)
+
+spec <- matrix(NA, ncol = 1, nrow= nrow(spec.split), dimnames = list(rownames(taxa), "species"))
+
+for(i in 1:nrow(spec)){
+
+ spec[i, ] <- ifelse(grepl(as.character(spec.split[i,1]), pattern = "_"), substr(spec.split[i,1], start = 1, stop = nchar(spec.split[i,1])-2), spec.split[i,1])
+
+}
+
+spec.split[,1] <- spec[rownames(spec) %in% rownames(taxa), 1]
+
+#the same for the other half
+spec <- matrix(NA, ncol = 1, nrow= nrow(spec.split), dimnames = list(rownames(taxa), "species"))
+
+for(i in 1:nrow(spec)){
+
+ spec[i, ] <- ifelse(grepl(as.character(spec.split[i,2]), pattern = "_"), substr(spec.split[i,2], start = 1, stop = nchar(spec.split[i,2])-2), spec.split[i,2])
+
+}
+
+spec.split[,2] <- spec[rownames(spec) %in% rownames(taxa), 1]
+
+spec = paste(spec.split[,1], spec.split[,2]) %>% as.matrix()
+rownames(spec) <- rownames(taxa)
+
+taxa[, 7] <- spec[rownames(spec) %in% rownames(taxa),1]
+
+#for Order
+taxa[, 4] <- ifelse(taxa[,4] == "Haloplasmatales_A", "Haloplasmatales", taxa[,4])
+
+taxa[taxa== " "] <- NA
+
+taxa %>% dim
+
+genome_quality <- read_tsv(quality_file, show_col_types = FALSE) %>%
+  mutate(Quality_Score = Completeness - (5*Contamination)) %>%
+  left_join(taxonomy, by = c("Bin Id" = "user_genome")) %>%
+  mutate(Name = Label) %>%
+  dplyr::select(-Label)
+
+
+```
+
+```{r, plot_contam_vs_quality}
+plt <- ggplot(genome_quality, aes(x = Contamination, y = Completeness, color = phylum, 
+                                  text =      paste("Bin Id:", `Bin Id`, "\nName",Name,"\nQuality score:", Quality_Score))) +
+  geom_point() + xlab('Contamination [%]') + ylab('Completeness [%]') +
+  theme_minimal()
+ggplotly(plt,tooltip = c('text' ))
+
+
+```
+
+## 2.7. Abundance
+### Calculate mapping rate
+
+```{r, mapping_rate, fig.width=1, fig.height=2}
+Counts <- read_tsv(counts_file, show_col_types = FALSE)
+read_stats <-read_tsv(readstats_file, show_col_types = FALSE) %>% filter(Step == "QC" )
+
+d <- tibble( Sample= colnames(Counts)[-1],
+            Mapped_Reads = colSums(Counts[,-1]),
+             x=0
+             ) %>%
+    left_join(read_stats, on = "Sample") %>%
+  mutate(Mapping_rate = Mapped_Reads / (Reads_pe*2+Reads_se) *100)
+
+plt <- ggplot(d, aes(y = Mapping_rate, x=x,text=paste("Sample:",Sample))) +
+  ylim(c(0, 100))+
+  xlim(c(-0.1,0.1)) +
+   geom_beeswarm() + 
+  theme_minimal()
+
+plt
+
+ggplotly(plt,tooltip = c('text','y' ))
+
+```
+
+# 3. Alpha diversity: we do use relative abundance of rarefied data
+```{r}
+count.df <- as(otu_table(pst.count), "matrix")
+rarecurve(x= t(count.df), MARGIN = 1, sample = 1000, label = TRUE)
+
+ps.rar <- rarefy_even_depth(pst.count, replace = FALSE, sample.size = 1000)
+```
+
+
+
+```{r}
+
+ps.rel <- transform_sample_counts(ps.rar, function(x){x/sum(x)*100})
+
+Chao1 =estimate_richness(physeq = pst.count, split = TRUE, measures = "Chao1")#for richness, we don't use rarefied table
+Chao1 <- Chao1[rownames(Chao1) %in% sample_names(ps.rar),]    
+
+Shannon = estimate_richness(ps.rel, split = TRUE, measures = "Shannon")
+
+library(picante)
+FaithPD = pd(t(otu_table(ps.rel)), tree = phy_tree(ps.rel), include.root = TRUE)$PD
+
+              
+#adding the indexes to the metadatas              
+alpha.df <- data.frame(sample_data(ps.rel), Chao1=Chao1[[1]],
+                                    Shannon = Shannon$Shannon,  FaithPD = FaithPD)   
+colnames(alpha.df)[51] <- "1-benzopyrrol"
+rm(Chao1, Shannon, FaithPD)
+
+``` 
+
+## 3.1. Generalized linear mixed effect model for alpha diversity indices
+```{r}
+library(nlme)
+library(lme4)
+library(lmerTest)
+library(car)
+library(lsmeans)
+library(postHoc)
+library(multcomp)
+
+
+alpha.df %>% filter(round == "R1") %>% dplyr::select(pig.no, treatment)
+alpha.df$pen2 <-factor(ifelse(alpha.df$pen %in% c("A1", "A2", "A3"), "A",
+ifelse(alpha.df$pen %in% c("B1", "B2", "B3"), "B",
+ifelse(alpha.df$pen %in% c("C1", "C2", "C3"), "C", "D"))), levels = c("A", "B", "C", "D"))
+
+
+
+
+
+glmer.helper <- function(df, round.n =3, response, formu, pair.form, plot.form, n.round, st.seed = 10){
+  models <-list()
+  summeries <- list()
+  emms <- list()
+  contrs <- list()
+  plots <- list()
+  pacman::p_load(nlme, lme4, lmerTest, car, lsmeans, postHoc, multcomp, glue)
+
+#a function to round numbers and give you numeric values with your desired number of digits. E.g. if you want your table to show numbers in 3 digits, you can uniformly round your table to get numbers in 3 digits etc.
+rounder <- function(x, n.round) {
+x = as.numeric(x)
+
+if (grepl(x = round(x, n.round), pattern = ".", fixed = T) & 
+trunc(x) != 0  & 
+nchar(trunc(abs(x))) >= n.round) {
+  
+ x = round(x)
+
+}  else if (trunc(x) == 0 &
+nchar(round(abs(x), digits = n.round-1)) == n.round ){
+
+ x = paste0(round(x, digits = n.round-1), ".0")
+  
+} else if (trunc(x) == 0 & 
+nchar(round(abs(x), digits = n.round-1)) == n.round +1){
+
+ x = round(x, digits = n.round-1)
+  
+} else if (trunc(x) == 0 & 
+nchar(round(abs(x), digits = n.round-1)) < n.round ){
+
+ x = paste0(round(x, digits = n.round-1), ".0")
+
+} else if (trunc(x) !=0 &
+ nchar(round(abs(x), digits = n.round-1)) == n.round + 1){
+
+  x = round(x, digits = n.round-1)
+
+} else if (trunc(x) !=0 & nchar(round(abs(x))) == nchar(trunc(abs(x))) ){
+ x = round(x, digits = n.round - nchar(trunc(abs(x))))
+
+ if(nchar(abs(x))<n.round){
+
+  x = paste0(x, ".0")
+
+ } else {
+  x = x
+ }
+
+}
+return(x)
+}
+
+#here I vectorize my function to work for vectors as well
+rounder <- Vectorize(FUN = rounder)
+
+#model
+  for(i in response){
+  formula <- as.formula(paste(i, formu))
+  formula.compare <- as.formula(pair.form)
+  formula.plot <- as.formula(plot.form)
+
+  ml <- glmer(formula = formula,
+            data = df, family = Gamma(link = "log"), 
+            control = glmerControl(c("bobyqa", "bobyqa")))
+
+#models
+  models[[i]] <-ml
+#summaries
+  summeries[[i]] <- summary(ml)
+#emmeans
+  set.seed(seed = st.seed)
+
+  emms[[i]] <- emmeans(ml, formula.compare,  type = "response")$emmeans %>% 
+  cld( adjust = "BH", Letters = letters) %>% 
+  data.frame() %>% 
+  mutate(new.arg = paste0(bp, dss)) %>%
+  mutate(treat = ifelse(new.arg == "NoNo", 
+  "CT", ifelse(new.arg == "YesNo", 
+  "BP", ifelse(new.arg == "NoYes", 
+  "DSS", "DSSBP")))) %>% #group_by(sex)%>% 
+  mutate(check = ifelse( unique(.group) %>% length() > 1, "TRUE", "FALSE")) %>% 
+  mutate(resps = ifelse(check == "TRUE",
+  glue("{rounder(response, n.round = round.n)} ({rounder(asymp.LCL, n.round = round.n)}-{rounder(asymp.UCL, n.round = round.n)}){.group}"), 
+  glue("{rounder(response, n.round = round.n)} ({rounder(asymp.LCL, n.round = round.n)}-{rounder(asymp.UCL, n.round = round.n)})"))) %>% 
+  dplyr::select(-bp, -dss, -new.arg, -df, 
+  -asymp.LCL, -asymp.UCL, -response, -SE, -.group, - check) %>% 
+  pivot_wider(names_from = treat, values_from = resps)  
+
+#contrasts
+  set.seed(seed = st.seed)
+
+  contrs[[i]] <- emmeans(ml, formula.compare, type = "response")$contrasts %>% 
+  cld(Letters = letters, adjust = "BH") %>%
+  data.frame() %>%
+  mutate(contr = ifelse(contrast == "No No / No Yes", 
+  "CT vs. DSS", ifelse(contrast== "No No / Yes No", 
+  "CT vs. BP", ifelse(contrast == "Yes No / No Yes", 
+  "BP vs. DSS", ifelse(contrast == "No No / Yes Yes",
+  "CT vs. DSSBP", ifelse(contrast == "Yes No / Yes Yes", 
+  "BP vs. DSSBP", "DSS vs. WDDSS" )))))) %>%
+  dplyr::select(-df, -null, -contrast,-p.value, -SE, -z.ratio, -ratio)%>% 
+  pivot_wider(names_from = contr, values_from = .group) 
+
+  #plots
+  formula3 <- 
+  plots[[i]] <- emmip(ml, formula.plot) + theme_bw() + ggtitle(glue("Interaction plot for {i}"))          
+  }
+  
+  structure(list(models, summeries, emms, contrs, plots))
+}
+ 
+
+
+resps <- colnames(alpha.df)[c(54:56)]
+
+#checking the range of the data
+col.names <- list()
+for(i in resps){
+  col.names[i]<- paste(range(alpha.df[,i])[1], range(alpha.df[,i])[2])
+}
+
+
+
+test <- glmer.helper(df = alpha.df, response = resps, st.seed = 10, 
+pair.form = "pairwise ~ bp + dss ",
+formu = " ~ bp * dss + sex + round +  (1|litter)",
+plot.form = "dss~bp ")
+
+
+
+emmeans(lm, pairwise ~ bp + dss, type = "response")$emmeans %>% cld(Letters = letters,  adjust = "BH") %>% data.frame() %>% mutate(trat = c("BP", "DSSBP", "CT", "DSS")) %>% dplyr::select(trat, response, asymp.LCL, asymp.UCL, .group, -bp,-dss, -SE, -df) %>% mutate(resp = paste0(round(response,2), "(", round(asymp.LCL,2), "-", round(asymp.UCL,2), ")",.group))
+
+#writing up the results
+lapply(test[[3]], function(x) write.table( data.frame(x), './AlphaDiversity/alpha.tsv', append= T, sep= "\t", row.names = F))
+
+
+alpha.res <- data.frame(alpha = rep(resps,  each = 1), rbind(test[[3]]$Chao1, test[[3]]$Shannon, test[[3]]$FaithPD) )%>% column_to_rownames("alpha") %>% dplyr::select(4,3,1,2)
+
+write.table(alpha.res, './outputs/alpha.tsv', sep = "\t")
+ 
+```
+
+# 4. Blood and other biomarkers
+
+## 4.1. Before-after analysis of blood samples for d0 and d36
+```{r}
+#loading data
+df <- sample_data(pst.count) %>% data.frame() %>% dplyr::select(1:8) 
+
+df$pen <- factor(ifelse(df$pen %in% c("A1", "A2", "A3"), "A",
+ifelse(df$pen %in% c("B1", "B2", "B3"), "B",
+ifelse(df$pen %in% c("C1", "C2", "C3"), "C", "D"))), levels = c("A", "B", "C", "D"))
+df$pig_no <- as.character(df$pig_no)
+bloods <- xlsx::read.xlsx("./blood_d21_d37.xlsx", sheetIndex = 1) 
+bloods$treat <- factor(bloods$treat, levels = levels(df$treatment))
+bloods$round <- factor(bloods$round, levels  = levels(df$round))
+bloods$litter <- factor(bloods$litter, levels  = levels(df$litter))
+bloods$day <- factor(bloods$day, levels = c("d21", "d37"))
+bloods$pen2 <- factor(ifelse(bloods$pen %in% c("A1", "A2", "A3"), "A",
+ifelse(bloods$pen  %in% c("B1", "B2", "B3"), "B",
+ifelse(bloods$pen  %in% c("C1", "C2", "C3"), "C", "D"))), levels = c("A", "B", "C", "D"))
+
+bloods$bp <- ifelse(bloods$treat %in% c("BP", "DSSBP"), "Yes", "No")
+bloods$dss <- ifelse(bloods$treat %in% c("DSS", "DSSBP"), "Yes", "No")
+
+colnames(bloods)[10] <-"Hemoglobin"
+colnames(bloods)[11] <-"Hematocrit"
+colnames(bloods)[12] <- "Platelets" 
+
+glmer.helper <- function(df, round.n =3, response, formu, pair.form, plot.form, n.round, st.seed = 10){
+  models <-list()
+  summeries <- list()
+  emms <- list()
+  contrs <- list()
+  plots <- list()
+  pacman::p_load(nlme, lme4, lmerTest, car, lsmeans, postHoc, multcomp, glue)
+
+#a function to round numbers and give you numeric values with your desired number of digits. E.g. if you want your table to show numbers in 3 digits, you can uniformly round your table to get numbers in 3 digits etc.
+rounder <- function(x, n.round) {
+x = as.numeric(x)
+
+if (grepl(x = round(x, n.round), pattern = ".", fixed = T) & 
+trunc(x) != 0  & 
+nchar(trunc(abs(x))) >= n.round) {
+  
+ x = round(x)
+
+}  else if (trunc(x) == 0 &
+nchar(round(abs(x), digits = n.round-1)) == n.round ){
+
+ x = paste0(round(x, digits = n.round-1), ".0")
+  
+} else if (trunc(x) == 0 & 
+nchar(round(abs(x), digits = n.round-1)) == n.round +1){
+
+ x = round(x, digits = n.round-1)
+  
+} else if (trunc(x) == 0 & 
+nchar(round(abs(x), digits = n.round-1)) < n.round ){
+
+ x = paste0(round(x, digits = n.round-1), ".0")
+
+} else if (trunc(x) !=0 &
+ nchar(round(abs(x), digits = n.round-1)) == n.round + 1){
+
+  x = round(x, digits = n.round-1)
+
+} else if (trunc(x) !=0 & nchar(round(abs(x))) == nchar(trunc(abs(x))) ){
+ x = round(x, digits = n.round - nchar(trunc(abs(x))))
+
+ if(nchar(abs(x))<n.round){
+
+  x = paste0(x, ".0")
+
+ } else {
+  x = x
+ }
+
+}
+return(x)
+}
+
+#here I vectorize my function to work for vectors as well
+rounder <- Vectorize(FUN = rounder)
+
+#model
+  for(i in response){
+  formula <- as.formula(paste(i, formu))
+  formula.compare <- as.formula(pair.form)
+  formula.plot <- as.formula(plot.form)
+
+  ml <- glmer(formula = formula,
+            data = df, family = Gamma(link = "log"), 
+            control = glmerControl(c("bobyqa", "bobyqa")))
+
+#models
+  models[[i]] <-ml
+#summaries
+  summeries[[i]] <- summary(ml)
+#emmeans
+  set.seed(seed = st.seed)
+
+  emms[[i]] <- emmeans(ml, formula.compare,  type = "response")$emmeans %>% 
+  cld( adjust = "BH", Letters = letters) %>% 
+  data.frame() %>% 
+  mutate(new.arg = paste0(bp, dss)) %>%
+  mutate(treat = ifelse(new.arg == "NoNo", 
+  "CT", ifelse(new.arg == "YesNo", 
+  "BP", ifelse(new.arg == "NoYes", 
+  "DSS", "DSSBP")))) %>% #group_by(sex)%>% 
+  mutate(check = ifelse( unique(.group) %>% length() > 1, "TRUE", "FALSE")) %>% 
+  mutate(resps = ifelse(check == "TRUE",
+  glue("{rounder(response, n.round = round.n)} ({rounder(asymp.LCL, n.round = round.n)}-{rounder(asymp.UCL, n.round = round.n)}){.group}"), 
+  glue("{rounder(response, n.round = round.n)} ({rounder(asymp.LCL, n.round = round.n)}-{rounder(asymp.UCL, n.round = round.n)})"))) %>% 
+  dplyr::select(-bp, -dss, -new.arg, -df, 
+  -asymp.LCL, -asymp.UCL, -response, -SE, -.group, - check) %>% 
+  pivot_wider( id_cols = treat, names_from = day, values_from = resps)  
+
+#contrasts
+  #set.seed(seed = st.seed)
+
+  #contrs[[i]] <- emmeans(ml, formula.compare, type = "response")$contrasts %>% 
+  #cld(Letters = letters, adjust = "BH") %>%
+  #data.frame() %>%
+  #mutate(contr = ifelse(contrast == "No No / No Yes", 
+ # "CT vs. DSS", ifelse(contrast== "No No / Yes No", 
+  #"CT vs. BP", ifelse(contrast == "Yes No / No Yes", 
+  #"BP vs. DSS", ifelse(contrast == "No No / Yes Yes",
+ # "CT vs. DSSBP", ifelse(contrast == "Yes No / Yes Yes", 
+ # "BP vs. DSSBP", "DSS vs. WDDSS" )))))) %>%
+ # dplyr::select(-df, -null, -contrast,-p.value, -SE, -z.ratio, -ratio)%>% 
+ # pivot_wider(names_from = contr, values_from = .group) 
+
+  #plots
+ 
+  plots[[i]] <- emmip(ml, formula.plot) + theme_bw() + ggtitle(glue("Interaction plot for {i}"))          
+  }
+  
+  structure(list(models, summeries, emms, contrs, plots))
+}
+ 
+
+
+resps <- colnames(bloods)[c(9:17)]
+
+#checking the range of the data
+col.names <- list()
+for(i in resps){
+  col.names[i]<- paste(range(bloods[,i])[1], range(bloods[,i])[2])
+}
+
+
+
+test <- glmer.helper(df = bloods, response = resps, st.seed = 10, 
+pair.form = "pairwise ~  day | bp + dss", #for changes across day
+#pair.form = "pairwise ~  bp + dss | day", #for changes across day/treatment
+formu = " ~ day + bp + dss + day*bp + day*dss + day * bp * dss + sex + round +  (1|litter)",
+plot.form = "dss~day | bp")
+
+
+
+
+blood_res <- data.frame(blood = rep(resps,  each = 4), rbind(test[[3]]$Red.blood.cells, test[[3]]$Hemoglobin, test[[3]]$Hematocrit, test[[3]]$Platelets, test[[3]]$White.blood.cells, test[[3]]$Neutrophils, test[[3]]$Lymphocytes, test[[3]]$Monocytes, test[[3]]$Eosinophils))  %>% dplyr::select(1,2,4,3)
+
+write.table(blood_res, './outputs/blood_d21_36_daywise.tsv', sep = "\t")
+```
+
+### 4.1.1 Visualizing the BACI results for blood
+```{r}
+
+res_blood <- list()
+
+for(i in resps) {
+res_blood[[i]] <- emmeans(test[[1]][[i]], pairwise ~  day | bp + dss,  type = "response", adjust = "BH")$emmeans %>% 
+  cld(adjust = "BH", Letters = letters) %>% 
+  data.frame() %>% 
+  mutate(new.arg = paste0(bp, dss)) %>%
+  mutate(treat = ifelse(new.arg == "NoNo", 
+  "CT", ifelse(new.arg == "YesNo", 
+  "BP", ifelse(new.arg == "NoYes", 
+  "DSS", "DSSBP")))) %>% rename(Low = asymp.LCL, UP = asymp.UCL) %>% 
+  dplyr::select(-bp, -dss, -new.arg, -df, 
+   -SE, -.group)
+}
+res_blood <- data.frame(blood = rep(resps,  each = 8), rbind(res_blood$Red.blood.cells, res_blood$Hemoglobin, res_blood$Hematocrit, res_blood$Platelets, res_blood$White.blood.cells, res_blood$Neutrophils, res_blood$Lymphocytes, res_blood$Monocytes, res_blood$Eosinophils)) 
+res_blood$treat <- factor(res_blood$treat, levels = c("CT", "BP", "DSS", "DSSBP"))
+
+str_name <- as.vector(c("Eosinophils, 10^9/l", 
+                       "Lymphocytes, 10^9/l",
+                       "Platelets, 10^9/l",
+                       "Hematocrit, % total blood",
+                       "Monocytes, 10^9/l",
+                       "Red blood cells, 10^12/l",
+                       "Hemoglobin, gr/l",
+                       "Neutrophils, 10^9/l",
+                       "White blood cells, 10^9/l"))
+
+names(str_name) <- c("Eosinophils", 
+                       "Lymphocytes",
+                       "Platelets",
+                       "Hematocrit",
+                       "Monocytes",
+                       "Red.blood.cells",
+                       "Hemoglobin",
+                       "Neutrophils",
+                       "White.blood.cells")
+#df for confidence interval of d37blood
+df_con <- res_blood[res_blood$day == "d37",]
+#plot
+
+res_blood %>% ggplot() +
+geom_line(aes(x = day, y = response, group = treat, linetype = treat, color = treat)) + 
+facet_wrap(~ blood, scales = "free_y", labeller = as_labeller(str_name)) + 
+geom_errorbar(data = df_con, aes(x = day, y = response, 
+ymin = Low, ymax = UP, color = treat), width = 0.06, show.legend = FALSE)+
+labs(linetype = "Treatment groups", color = "Treatment groups") + 
+geom_point(aes(x = day, y = response), fill = "red", pch = 21, size = 3, alpha = 0.6) + 
+theme_bw() +
+ylab(NULL) +
+xlab(NULL)+
+theme(strip.background = element_rect(fill = "#0a3731"),
+text = element_text(face = "bold"),
+strip.text = element_text(color = "white", face = "bold")) +
+ scale_color_manual(values = c(CT = "#12e2e9", BP = "#f605fa", DSS = "#042eff", DSSBP = "#ff9d00"))
+
+ggsave("./outputs/bars_box/blood_BACI.jpeg", dpi = 300, width = 10, height = 8)
+```
+
+## 4.2. Generalized linear mixed effect model for chemical data
+```{r}
+library(nlme)
+library(lme4)
+library(lmerTest)
+library(car)
+library(lsmeans)
+library(postHoc)
+library(multcomp)
+
+chem_dat <- xlsx::read.xlsx("./Chemicals_CCD2_Full.xlsx", sheetName = "total")
+
+chem_dat$pen <- factor(ifelse(chem_dat$pen %in% c("A1", "A2", "A3"), "A",
+ifelse(chem_dat$pen %in% c("B1", "B2", "B3"), "B",
+ifelse(chem_dat$pen %in% c("C1", "C2", "C3"), "C", "D"))), levels = c("A", "B", "C", "D"))
+chem_dat$treatment <- factor(chem_dat$treatment, levels = c("CT", "BP", "DSS", "DSSBP"))
+chem_dat$round <- factor(chem_dat$round, levels  = c("R1", "R2", "R3"))
+chem_dat$litter <- factor(chem_dat$litter, levels  = unique(chem_dat$litter))
+chem_dat$bp <- ifelse(chem_dat$treatment %in% c("BP", "DSSBP"), "Yes", "No")
+chem_dat$dss <- ifelse(chem_dat$treatment %in% c("DSS", "DSSBP"), "Yes", "No")
+
+glmer.helper <- function(df, round.n =3, response, formu, pair.form, plot.form, n.round, st.seed = 10){
+  models <-list()
+  summeries <- list()
+  emms <- list()
+  contrs <- list()
+  plots <- list()
+  pacman::p_load(nlme, lme4, lmerTest, car, lsmeans, postHoc, multcomp, glue)
+
+#a function to round numbers and give you numeric values with your desired number of digits. E.g. if you want your table to show numbers in 3 digits, you can uniformly round your table to get numbers in 3 digits etc.
+rounder <- function(x, n.round) {
+x = as.numeric(x)
+
+if (grepl(x = round(x, n.round), pattern = ".", fixed = T) & 
+trunc(x) != 0  & 
+nchar(trunc(abs(x))) >= n.round) {
+  
+ x = round(x)
+
+}  else if (trunc(x) == 0 &
+nchar(round(abs(x), digits = n.round-1)) == n.round ){
+
+ x = paste0(round(x, digits = n.round-1), ".0")
+  
+} else if (trunc(x) == 0 & 
+nchar(round(abs(x), digits = n.round-1)) == n.round +1){
+
+ x = round(x, digits = n.round-1)
+  
+} else if (trunc(x) == 0 & 
+nchar(round(abs(x), digits = n.round-1)) < n.round ){
+
+ x = paste0(round(x, digits = n.round-1), ".0")
+
+} else if (trunc(x) !=0 &
+ nchar(round(abs(x), digits = n.round-1)) == n.round + 1){
+
+  x = round(x, digits = n.round-1)
+
+} else if (trunc(x) !=0 & nchar(round(abs(x))) == nchar(trunc(abs(x))) ){
+ x = round(x, digits = n.round - nchar(trunc(abs(x))))
+
+ if(nchar(abs(x))<n.round){
+
+  x = paste0(x, ".0")
+
+ } else {
+  x = x
+ }
+
+}
+return(x)
+}
+
+#here I vectorize my function to work for vectors as well
+rounder <- Vectorize(FUN = rounder)
+
+#model
+  for(i in response){
+  formula <- as.formula(paste(i, formu))
+  formula.compare <- as.formula(pair.form)
+  formula.plot <- as.formula(plot.form)
+
+  ml <- glmer(formula = formula,
+            data = df, family = Gamma(link = "log"), 
+            control = glmerControl(c("bobyqa", "bobyqa")))
+
+#models
+  models[[i]] <-ml
+#summaries
+  summeries[[i]] <- summary(ml)
+#emmeans
+  set.seed(seed = st.seed)
+
+  emms[[i]] <- emmeans(ml, formula.compare,  type = "response")$emmeans %>% 
+  cld( adjust = "BH", Letters = letters) %>% 
+  data.frame() %>% 
+  mutate(new.arg = paste0(bp, dss)) %>%
+  mutate(treat = ifelse(new.arg == "NoNo", 
+  "CT", ifelse(new.arg == "YesNo", 
+  "BP", ifelse(new.arg == "NoYes", 
+  "DSS", "DSSBP")))) %>% #group_by(sex)%>% 
+  mutate(check = ifelse( unique(.group) %>% length() > 1, "TRUE", "FALSE")) %>% 
+  mutate(resps = ifelse(check == "TRUE",
+  glue("{rounder(response, n.round = round.n)} ({rounder(asymp.LCL, n.round = round.n)}-{rounder(asymp.UCL, n.round = round.n)}){.group}"), 
+  glue("{rounder(response, n.round = round.n)} ({rounder(asymp.LCL, n.round = round.n)}-{rounder(asymp.UCL, n.round = round.n)})"))) %>% 
+  dplyr::select(-bp, -dss, -new.arg, -df, 
+  -asymp.LCL, -asymp.UCL, -response, -SE, -.group, - check) %>% 
+  pivot_wider(names_from = treat, values_from = resps)  
+
+#contrasts
+  set.seed(seed = st.seed)
+
+  contrs[[i]] <- emmeans(ml, formula.compare, type = "response")$contrasts %>% 
+  cld(Letters = letters, adjust = "BH") %>%
+  data.frame() %>%
+  mutate(contr = ifelse(contrast == "No No / No Yes", 
+  "CT vs. DSS", ifelse(contrast== "No No / Yes No", 
+  "CT vs. BP", ifelse(contrast == "Yes No / No Yes", 
+  "BP vs. DSS", ifelse(contrast == "No No / Yes Yes",
+  "CT vs. DSSBP", ifelse(contrast == "Yes No / Yes Yes", 
+  "BP vs. DSSBP", "DSS vs. WDDSS" )))))) %>%
+  dplyr::select(-df, -null, -contrast,-p.value, -SE, -z.ratio, -ratio)%>% 
+  pivot_wider(names_from = contr, values_from = .group) 
+
+  #plots
+  formula3 <- 
+  plots[[i]] <- emmip(ml, formula.plot) + theme_bw() + ggtitle(glue("Interaction plot for {i}"))          
+  }
+  
+  structure(list(models, summeries, emms, contrs, plots))
+}
+ 
+
+
+resps <- colnames(chem_dat)[c(8:16, 18:24,26:30)]
+resps <- colnames(chem_dat)[c(17, 25)]
+resps <- colnames(chem_dat)[c(11, 13)]
+#checking the range of the data
+col.names <- list()
+for(i in resps){
+  col.names[i]<- paste(range(chem.dat[,i])[1], range(chem.dat[,i])[2])
+}
+
+test <- glmer.helper(df = chem_dat, response = resps, st.seed = 10, 
+pair.form = "pairwise ~ bp + dss |sample_type",
+formu = " ~ bp * dss + sex + round + sample_type +  (1|litter)",
+plot.form = "dss~bp ")
+
+junk <- data.frame(chems = rep(resps,  each = 2), 
+                        rbind(test[[3]]$Butyrate,
+                        test[[3]]$Iso.acids
+                        ))  %>% dplyr::select(1,2,4,3,6,5)
+write.table(junk, "./outputs/junk.tsv", sep = "\t")
+
+chem_res <- data.frame(chems = rep(resps,  each = 2), 
+                        rbind(test[[3]]$SCFA, 
+                        test[[3]]$Acetate, 
+                        test[[3]]$Propionate, 
+                        test[[3]]$Butyrate,
+                        test[[3]]$Valerate,
+                        test[[3]]$Iso.acids,
+                        test[[3]]$Biogenic.amines,
+                        test[[3]]$L.threonine,
+                        test[[3]]$Agmatine,
+                        test[[3]]$L.valine,
+                        test[[3]]$L.lysine,
+                        test[[3]]$Putrescine,
+                        test[[3]]$Cadaverine,
+                        test[[3]]$Tyramine,
+                        test[[3]]$Indoles,
+                        test[[3]]$L.tryptofane,
+                        test[[3]]$indol.3.propionate,
+                        test[[3]]$X4.methylphenol,
+                        test[[3]]$X1.benzopyrrol,
+                        test[[3]]$Skatole,
+                        test[[3]]$Ammonia) ) %>% dplyr::select(1,2,4,5,6,3)
+
+write.table(chem_res, './outputs/chemicals.tsv', sep = "\t")
+``` 
+
+### 4.2.1. making a pairwise comparision for sample type
+```{r}
+
+
+
+rounder <- function(x, n.round) {
+x = as.numeric(x)
+
+if (grepl(x = round(x, n.round), pattern = ".", fixed = T) & 
+trunc(x) != 0  & 
+nchar(trunc(abs(x))) >= n.round) {
+  
+ x = round(x)
+
+}  else if (trunc(x) == 0 &
+nchar(round(abs(x), digits = n.round-1)) == n.round ){
+
+ x = paste0(round(x, digits = n.round-1), ".0")
+  
+} else if (trunc(x) == 0 & 
+nchar(round(abs(x), digits = n.round-1)) == n.round +1){
+
+ x = round(x, digits = n.round-1)
+  
+} else if (trunc(x) == 0 & 
+nchar(round(abs(x), digits = n.round-1)) < n.round ){
+
+ x = paste0(round(x, digits = n.round-1), ".0")
+
+} else if (trunc(x) !=0 &
+ nchar(round(abs(x), digits = n.round-1)) == n.round + 1){
+
+  x = round(x, digits = n.round-1)
+
+} else if (trunc(x) !=0 & nchar(round(abs(x))) == nchar(trunc(abs(x))) ){
+ x = round(x, digits = n.round - nchar(trunc(abs(x))))
+
+ if(nchar(abs(x))<n.round){
+
+  x = paste0(x, ".0")
+
+ } else {
+  x = x
+ }
+
+}
+return(x)
+}
+
+#here I vectorize my function to work for vectors as well
+rounder <- Vectorize(FUN = rounder)
+
+samps <- list()
+
+for(i in resps){
+samps[[i]] <- emmeans(test[[1]][[i]], pairwise ~ sample_type , type = "response")$emmeans %>% 
+cld(Letters = letters) %>% data.frame() %>% 
+  mutate(ci = glue("({rounder(asymp.LCL, 3)}-{rounder(asymp.UCL,3)})")) %>% dplyr::select(-SE, -df, -asymp.LCL, -asymp.UCL) %>%
+  mutate(check = ifelse( unique(.group) %>% length() > 1, "TRUE", "FALSE")) %>% 
+  mutate(resps = ifelse(check == "TRUE",
+  glue("{rounder(response, n.round = 3)} {ci}{.group}"), 
+  glue("{rounder(response, n.round = 3)} {ci}"))) %>% 
+  dplyr::select(-.group, - check, -response, -ci) %>% 
+  pivot_wider(names_from = sample_type, values_from = resps)  
+}
+
+chem_samp <- data.frame(chems = rep(resps,  each = 1), 
+                        rbind(samps$SCFA, 
+                        samps$Acetate, 
+                        samps$Propionate, 
+                        samps$Butyrate,
+                        samps$Valerate,
+                        samps$Iso.acids,
+                        samps$Biogenic.amines,
+                        samps$L.threonine,
+                        samps$Agmatine,
+                        samps$L.valine,
+                        samps$L.lysine,
+                        samps$Putrescine,
+                        samps$Cadaverine,
+                        samps$Tyramine,
+                        samps$Indoles,
+                        samps$L.tryptofane,
+                        samps$indol.3.propionate,
+                        samps$X4.methylphenol,
+                        samps$X1.benzopyrrol,
+                        samps$Skatole,
+                        samps$Ammonia) )
+
+
+write.table(chem_samp, './outputs/chemicals_sampletype.tsv', sep = "\t")
+ 
+```
+
+## 4.3. Body weight and fecal DM on day 37
+```{r}
+library(ggpubr)
+
+df <- data.frame(sample_data(pst.count)) %>% select(1:6, 11, 16)
+compares <- list(c("CT", "BP"),
+                 c("CT", "DSS"),
+                 c("CT", "DSSBP"),
+                 c("BP", "DSS"),
+                 c("BP", "DSSBP"),
+                 c("DSS", "DSSBP"))
+#plot for fecal dm
+set.seed(12)
+df %>% ggplot(aes(x = treatment, y = DM)) + 
+geom_violin(alpha = 0.04, trim = FALSE, draw_quantiles = TRUE, color = "red", fill = "#007f8b")+
+geom_boxplot(alpha = 0.52, aes(fill = treatment), width = 0.1) + 
+theme_bw() +
+geom_jitter(aes(shape = sex), size = 2, color = "#225640", alpha = 1)+
+#stat_compare_means(comparisons = compares,
+ #                    method =  "t.test", 
+  #                   hide.ns = TRUE, 
+   #                  pairwise = TRUE,
+    #                 label = "p.format")
+geom_pwc(aes(group = treatment), y.position = 45,
+          tip.length = 0, 
+          hide.ns = TRUE,
+          method = "emmeans_test", 
+          label = "p.adj.signif") + 
+xlab(NULL)          +
+ylab("Fecal DM, %")+
+labs(fill = "Treatment groups", shape = "Gender") + 
+guides(fill = guide_legend(order =1 )) + 
+theme(text = element_text(size = 10, face = "bold")) + 
+ggtitle("fecal DM on d37", "means are compared with emmeans test, BH ajusted")+
+scale_fill_manual(values = c(CT = "#12e2e9", BP = "#f605fa", DSS = "#042eff", DSSBP = "#ff9d00"))
+
+ggsave("./outputs/bars_box/fecalDM_d37.jpeg", dpi = 300, width =7, height = 8)
+
+
+#plot for body weight
+set.seed(12)
+df %>% ggplot(aes(x = treatment, y = weight)) + 
+geom_violin(alpha = 0.04, trim = FALSE, draw_quantiles = TRUE, color = "red", fill = "#007f8b")+
+geom_boxplot(alpha = 0.52, aes(fill = treatment), width = 0.1) + 
+theme_bw() +
+geom_jitter(aes(shape = sex), size = 2, color = "#225640", alpha = 1)+
+#stat_compare_means(comparisons = compares,
+ #                    method =  "t.test", 
+  #                   hide.ns = TRUE, 
+   #                  pairwise = TRUE,
+    #                 label = "p.format")
+geom_pwc(aes(group = treatment), y.position = 45,
+          tip.length = 0, 
+          hide.ns = TRUE,
+          method = "emmeans_test", 
+          label = "p.adj.signif") + 
+xlab(NULL)          +
+ylab("Body weight, Kg")+
+labs(fill = "Treatment groups", shape = "Gender") + 
+guides(fill = guide_legend(order =1 )) + 
+theme(text = element_text(size = 10, face = "bold")) + 
+ggtitle("Body weight on d37", "means are compared with emmeans test, BH ajusted")+
+scale_fill_manual(values = c(CT = "#12e2e9", BP = "#f605fa", DSS = "#042eff", DSSBP = "#ff9d00"))
+
+ggsave("./outputs/bars_box/bodyweight_d37.jpeg", dpi = 300, width =7, height = 8)
+```
+
+# 5. Beta diversity
+
+```{r}
+## transforme counts with centered log ratio
+ps.rel <- transform_sample_counts(pst.count, function(x) {x/sum(x)*100})
+
+
+ps.clr  <- transform_sample_counts(ps.rel, function(x){compositions::clr(x)}) 
+#transform(count.df, transformation = "clr")
+
+qplot(rowSums(otu_table(ps.clr)))
+
+
+## Variance stabilizing transformation
+
+library(DESeq2)
+
+count.tab <- as(pst.count@otu_table, "matrix")
+vst.count = DESeq2::varianceStabilizingTransformation(count.tab , blind = FALSE)
+ps.vst <- pst.count
+otu_table(ps.vst) <- otu_table(vst.count, taxa_are_rows = TRUE)
+
+qplot(rowSums(otu_table(ps.vst)))
+qplot(log(rowSums(otu_table(pst.count))))
+
+```
+
+
+## 5.1. PCA of the Aitchison distance
+```{r pca}
+data <- as(otu_table(ps.vst), "matrix")
+
+metadata <- sample_data(ps.vst) %>% data.frame() %>% rownames_to_column("Sample")
+
+transformed_data <- prcomp(t(data),scores=TRUE) 
+
+pca_data <- transformed_data$x %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "Sample") %>%
+  left_join(metadata, by = c("Sample"))
+
+
+ggplot(pca_data, aes(x = PC1, y = PC2, color = treatment))  + 
+  geom_vline(xintercept = 0, lty = 2, color =  "black", alpha = 0.2) +
+  geom_hline(yintercept = 0, lty = 2, color =  "black", alpha = 0.2) +
+  geom_point(size = 8, aes(shape = sex)) + 
+  theme_minimal() +
+  scale_color_manual(values = c(CT = "#12e2e9", BP = "#f605fa", DSS = "#042eff", DSSBP = "#ff9d00"))+
+  ggtitle(label = "PCA plot", "Variance-stiabilizing transformed data") + 
+  stat_ellipse(aes(group = treatment, fill = treatment), show.legend = FALSE, type = "t",
+  level = 0.7, lty = 2, geom = "polygon", alpha = 0.1) + 
+  scale_fill_manual(values = c(CT = "#12e2e9", BP = "#f605fa", DSS = "#042eff", DSSBP = "#ff9d00")) +
+  theme(axis.text.x = element_text(size = 12), 
+  axis.text.y = element_text(size = 12), 
+  axis.title.x = element_text(face = "bold", size = 14),
+  axis.title.y = element_text(face = "bold", size = 14)) +
+  guides(color = guide_legend(order = 1, title = "Treatment groups",
+  title.theme = element_text(face = "bold")),
+  shape = guide_legend(order = 2, title = "Gender", title.theme = element_text( face = "bold"))) +
+  coord_fixed()
+
+ggsave("./outputs/PCA.vst.jpeg", width = 10, height = 8, dpi = 300)
+
+```
+
+## 5.2. PCoA and NMDS of Bray-Curtis distance 
+```{r}
+
+ps.log <- transform_sample_counts(ps.rel, function(x){log(x+1)})
+
+bray.pcoa=ordinate(ps.log, method="PCoA", distance = "bray")
+
+evals<-bray.pcoa$values$Eigenvalues
+
+plot_ordination(ps.log, bray.pcoa, color="treatment", 
+shape = "sex")+ 
+  geom_vline(xintercept = 0, lty = 2, color =  "black", alpha = 0.2) +
+  geom_hline(yintercept = 0, lty = 2, color =  "black", alpha = 0.2) +
+  geom_point(size = 6, aes(shape = sex)) + 
+  theme_minimal() +
+  scale_color_manual(values = c(CT = "#12e2e9", BP = "#f605fa", DSS = "#042eff", DSSBP = "#ff9d00"))+
+  ggtitle(label = "PCoA plot", "log-transformed rel_data") + 
+  stat_ellipse(aes(group = treatment, fill = treatment), show.legend = FALSE, type = "t",
+  level = 0.6, lty = 2, geom = "polygon", alpha = 0.1) + 
+  scale_fill_manual(values = c(CT = "#12e2e9", BP = "#f605fa", DSS = "#042eff", DSSBP = "#ff9d00")) +
+  theme(axis.text.x = element_text(size = 12), 
+  axis.text.y = element_text(size = 12), 
+  axis.title.x = element_text(face = "bold", size = 14),
+  axis.title.y = element_text(face = "bold", size = 14)) +
+  guides(color = guide_legend(order = 1, title = "Treatment groups",
+  title.theme = element_text(face = "bold")),
+  shape = guide_legend(order = 2, title = "Gender", title.theme = element_text( face = "bold"))) +
+geom_point(size = 5) + coord_fixed(sqrt(evals[2]/evals[1])) +
+labs(x = sprintf("PCo1 [%s%%]", round(evals/sum(evals)*100,1)[1]),
+     y = sprintf("PCo2 [%s%%]", round(evals/sum(evals)*100, 1)[2]))
+
+ggsave("./outputs/PCoA.log.jpeg", width = 10, height = 8, dpi = 300)
+
+# Bray NMDS
+bray.nmds <- ordinate(ps.log, method = "NMDS", distance = "bray")
+
+bray.stress = stressplot(bray.nmds)#in this dataset, R squared shows that the nMDS is perfectly able to capture variation in the data.
+plot(bray.nmds)#the red points are Transformed taxon-wise dissimilarities and the circles are Transformed sample-wise dissimilarities.
+
+plot_ordination(ps.log, bray.nmds, color = "treatment", 
+shape = "sex", title = "Bray-Curtis NMDS plot, LogT") +
+  geom_vline(xintercept = 0, lty = 2, color =  "black", alpha = 0.2) +
+  geom_hline(yintercept = 0, lty = 2, color =  "black", alpha = 0.2) +
+geom_point(size = 5) + theme_minimal() + 
+labs(col="Treatment gourp", shape = "Gender") + 
+xlab("NMDS1") + ylab ("NMDS2")+ 
+  scale_color_manual(values = c(CT = "#12e2e9", BP = "#f605fa", DSS = "#042eff", DSSBP = "#ff9d00"))+
+  ggtitle(label = "NMDS plot of Bray", "log-transformed rel_data") + 
+  stat_ellipse(aes(group = treatment, fill = treatment), show.legend = FALSE, type = "t",
+  level = 0.7, lty = 2, geom = "polygon", alpha = 0.1) + 
+  scale_fill_manual(values = c(CT = "#12e2e9", 
+  BP = "#f605fa", DSS = "#042eff", DSSBP = "#ff9d00")) +
+  theme(axis.text.x = element_text(size = 12), 
+  axis.text.y = element_text(size = 12), 
+  axis.title.x = element_text(face = "bold", size = 14),
+  axis.title.y = element_text(face = "bold", size = 14)) +
+  guides(color = guide_legend(order = 1, title = "Treatment groups",
+  title.theme = element_text(face = "bold")),
+  shape = guide_legend(order = 2, title = "Gender", title.theme = element_text( face = "bold"))) +
+  coord_fixed()
+
+  ggsave("./outputs/NMDS.log.bray.jpeg", width = 10, height = 8, dpi = 300)
+
+
+# WUniFrac NMDS
+wunifrac.nmds <- ordinate(ps.log, method = "NMDS", distance = "wunifrac")
+
+wunifrac.stress = stressplot(wunifrac.nmds)#in this dataset, R squared shows that the nMDS is perfectly able to capture variation in the data.
+plot(wunifrac.nmds)#the red points are Transformed taxon-wise dissimilarities and the circles are Transformed sample-wise dissimilarities.
+
+plot_ordination(ps.log, wunifrac.nmds, color = "treatment", 
+shape = "sex") +
+  geom_vline(xintercept = 0, lty = 2, color =  "black", alpha = 0.2) +
+  geom_hline(yintercept = 0, lty = 2, color =  "black", alpha = 0.2) +
+geom_point(size = 6) + theme_minimal() + 
+labs(col="Treatment gourp", shape = "Gender") + 
+xlab("NMDS1") + ylab ("NMDS2")+ 
+  scale_color_manual(values = c(CT = "#12e2e9", BP = "#f605fa", DSS = "#042eff", DSSBP = "#ff9d00"))+
+  ggtitle(label = "NMDS plot of WUnifrac", "log-transformed rel_data") + 
+  stat_ellipse(aes(group = treatment, fill = treatment), show.legend = FALSE, type = "t",
+  level = 0.6, lty = 2, geom = "polygon", alpha = 0.1) + 
+  scale_fill_manual(values = c(CT = "#12e2e9", 
+  BP = "#f605fa", DSS = "#042eff", DSSBP = "#ff9d00")) +
+  theme(axis.text.x = element_text(size = 12), 
+  axis.text.y = element_text(size = 12), 
+  axis.title.x = element_text(face = "bold", size = 14),
+  axis.title.y = element_text(face = "bold", size = 14)) +
+  guides(color = guide_legend(order = 1, title = "Treatment groups",
+  title.theme = element_text(face = "bold")),
+  shape = guide_legend(order = 2, title = "Gender", title.theme = element_text( face = "bold"))) +
+  coord_fixed()
+
+ggsave("./outputs/NMDS.log.wunifrac.jpeg", width = 10, height = 8, dpi = 300)
+```
+
+## 5.3. Distanc-based redundancy analysis
+```{r}
+library(vegan)
+ps.rel <- transform_sample_counts(pst.count, function(x){x/sum(x)})
+ps.log <- transform_sample_counts(ps.rel, function(x){log(x+1)})
+
+
+
+bray.dist = phyloseq::distance(ps.vst, method = "bray")
+wun.dist= phyloseq::distance(ps.vst, method = "wunifrac")
+
+bray.dist.log = phyloseq::distance(ps.log, method = "bray")
+wun.dist.log= phyloseq::distance(ps.log, method = "wunifrac")
+
+
+```
+
+### 5.3.1. Beta dispersion 
+```{r}
+df = data.frame(sample_data(ps.log ))
+df$pen2 <-factor(ifelse(df$pen %in% c("A1", "A2", "A3"), "A",
+ifelse(df$pen %in% c("B1", "B2", "B3"), "B",
+ifelse(df$pen %in% c("C1", "C2", "C3"), "C", "D"))), levels = c("A", "B", "C", "D"))
+
+xtabs(~pen2 + treatment + round, df)
+
+df %>% filter(pen != "D2") %>% group_by(treatment, pig.no, pen) %>% summarize() %>% data.frame() %>% summarize(table(treatment))
+
+set.seed(10)
+
+# Making a permutational iteration to be passed on later to our betadisper permutation
+h <- with(data = df,
+  how(within = Within(type = "free"),
+  plots = Plots(strata = pen2, type = "none"),
+    blocks = round, nperm = 999))
+permute::check(df, control = h)#to check if the permutation plan is okay, e.g. balanced or not. and also the nr. of possible permutations
+
+
+bray.disp<- vegan::betadisper(bray.dist.log, group = df$treatment, 
+                                 type = "centroid")
+# Permutational test for analysis of variance with pairwise comparison.
+perm.disp <- vegan::permutest(bray.disp , permutation =h, pairwise = TRUE)
+p.disp = perm.disp$tab$'Pr(>F)'[[1]]
+```
+
+```{r}
+library(glue)
+
+jpeg("./outputs/ordination/dispersion of variance_bray_log.jpeg",  units = "cm",
+res = 200, height = 15, width = 20)
+
+plot(bray.disp, col = c(CT = "#12e2e9", 
+  BP = "#f605fa", DSS = "#042eff", DSSBP = "#ff9d00"),
+bty = "n", las = 1, main = "Dispersion of variance around the centroids, Bray log", sub=NULL,
+  xlab = sprintf("PCo1 [%s%%]", round(bray.disp$eig[1]/sum(bray.disp$eig)*100)),
+ ylab = sprintf("PCo2 [%s%%]", round(bray.disp$eig[2]/sum(bray.disp$eig)*100)));text(glue("P = {round(p.disp, 2)}"), 
+ x = 0.35, y = -0.35, cex = 1.5, col = "red")
+
+dev.off()
+
+rm(bray.disp.red, perm.disp, p.disp)
+```
+
+```{r}
+#creating a balanced df
+df %>%group_by(treatment, round, pen2, litter, pig.no) %>% tally() %>% as.matrix()
+#pig P1, P9 and P18 will be removed
+df2 <- df %>% filter(!pig.no %in% c("P1", "P9", "P18"))
+xtabs(~ pen2+ treatment , df2)
+
+bray_mat <- as.matrix(bray.dist.log) 
+bray_mat <- bray_mat[rownames(df2), rownames(df2)] 
+
+set.seed(2000)
+h <- with(data = df2, 
+          how(within = Within(type = "none"), #we don't allow shuffling between pens 
+            plots = Plots(strata = pen2, type = "free"), #we allow shuffling of animals within each pen
+              blocks = round, nperm = 999))
+permute::check(df2, h)
+
+db.whole = vegan::dbrda(bray_mat ~ bp + dss + bp:dss + Condition(litter+ round + sex), 
+                               data = df2)    #Full model, omnibus test
+anova(db.whole, permutations = h)
+
+dbrda.bray = vegan::dbrda(bray_mat ~ bp*dss + Condition(litter+ round + sex), 
+                               data = df2)    # interaction/marginal effect
+anova(dbrda.bray, permutations = h, by = "margin")
+
+dbrda.bray = vegan::dbrda(bray_mat ~ bp + Condition(litter+ round + dss + sex), data = df2) #main effect of bp
+anova(dbrda.bray, permutations = h, by = "margin")
+
+dbrda.bray = vegan::dbrda(bray_mat ~ dss + Condition(litter+ round + bp + sex),  data = df2) #main effect of dss
+anova(dbrda.bray, permutations = h, by = "margin")
+
+dbrda.bray = vegan::dbrda(bray_mat  ~ sex + Condition(litter+ round + bp + dss), data = df2) #main effect of sex
+anova(dbrda.bray, permutations = h, by = "margin")
+
+dbrda.bray$tot.chi
+```
+
+
+### 5.3.2. Plotting from model scores
+```{r}
+
+# Extreacting the goodies :)
+score.site = vegan::scores(db.whole, display = "sites") %>% data.frame
+score.centroid = vegan::scores(db.whole, display = "cn") %>% as.data.frame
+rownames(score.centroid) <- levels(sample_data(ps.log)$treatment)
+
+eig.vals = db.whole$CCA$eig
+inertia.total = db.whole$tot.chi #Total variation (inertia) explained. This number should be used as the denominator for measuring the amount of variance out of totoal variance wxplained by each dbrda axis.
+
+#Ordination Plot
+score.site %>% ggplot(aes(dbRDA1, dbRDA2, shape = df2$sex, 
+                          color = df2$treatment)) +
+geom_hline(yintercept = 0, lty = 2, alpha =0.5) + 
+geom_vline(xintercept = 0, lty = 2, alpha = 0.5) +
+geom_point(size = 7) + 
+coord_fixed(sqrt(eig.vals[2]/eig.vals[1]))  + 
+scale_color_manual(values = c(CT = "#12e2e9", 
+  BP = "#f605fa", DSS = "#042eff", DSSBP = "#ff9d00")) + 
+theme_minimal() + 
+scale_y_continuous(na.value = c(-2, 3), n.breaks = 10) +
+scale_x_continuous(na.value = c(-1, 1), n.breaks = 10) + 
+labs(col="Treatment", shape = "Gender") + 
+xlab(label = paste("dbRDA1 [", round(eig.vals[[1]]/sum(eig.vals)*100, 1),"% of fitted and", 
+                    round(eig.vals[[1]]/inertia.total*100, 1), 
+                    "% of total variation]")) + 
+ylab(label = paste("dbRDA2 [", round(eig.vals[[2]]/sum(eig.vals)*100, 1),"% of fitted and", round(eig.vals[[2]]/inertia.total*100, 1),"% of total variation]")) + 
+theme(axis.title = element_text(size = 9), 
+text = element_text(size = 13, face = "bold"),
+    axis.text.x =element_text(size =10, face = "bold"),
+axis.text.y =element_text(size =10, face = "bold")) + 
+ggtitle(label = "dbRDA plot of scores for sample, bray", "Log transformed")  + 
+stat_ellipse(data = score.site, aes(dbRDA1, dbRDA2, fill = df2$treatment, color = df2$treatment), show.legend = F, inherit.aes = F, alpha = 0.2, position = "jitter", type = "euclid",  linetype = 3,  geom = "polygon", level = 0.8, segments =50 ) + 
+scale_fill_manual(values = c(CT = "#12e2e9", 
+  BP = "#f605fa", DSS = "#042eff", DSSBP = "#ff9d00")) + 
+  guides(color = guide_legend(order = 1))
+
+ggsave("./outputs/ordination/bray.dbRDA.scores.site.jpeg", height = 8, width = 9, dpi =300)
+
+rm(db.whole, db.whole.main, db.whole.margin, score.site, eig.vals, inertia.total)
+```
+
+
+# 6. Functional annotations
+
+## The relative abundance of functional annotations per sample: The abundance is calculated as the sum of the relative abundance of all bacteria containing a function.
+
+## 6.1. Kegg modules produced by Dram
+
+```{r, load_modules}
+
+kegg_modules= read_tsv(keggmodules_file,col_select = -1)
+module_names = kegg_modules %>% dplyr::select(c('module','module_name')) %>% distinct() %>% data.frame()
+
+
+
+view(head(kegg_modules))
+
+```
+
+```{r, module_presence}
+
+step_coverage_threshold= 0.8
+
+module_step_coverage_matrix = pivot_wider(kegg_modules,  
+                                   id_cols = genome,
+                                   names_from = module, 
+                                   values_from = step_coverage
+                                   ) %>%
+                              column_to_rownames("genome") %>% as.matrix() 
+
+module_step_coverage_matrix = module_step_coverage_matrix[, colSums(module_step_coverage_matrix) > 0]
+
+
+hatmap<- pheatmap(module_step_coverage_matrix, show_colnames = F)
+
+module_presence_matrix = 1 * (module_step_coverage_matrix > step_coverage_threshold)
+
+module_presence_matrix = module_presence_matrix[, colSums(module_presence_matrix) > 0]
+
+ pheatmap(module_presence_matrix, show_colnames = F)
+```
+
+```{r,heatmap_interactive2}
+
+module_step_coverage_mat <- module_step_coverage_matrix[rownames(module_step_coverage_matrix) %in% rownames(tax_table(pst.count)),] #trimming dataset 
+
+d_tax= data.frame(tax_table(ps.log)) %>% rownames_to_column("user_genome") %>%
+  mutate(Label = ifelse(is.na(Species) & is.na(Genus), paste0("[",Family,"]", "_", user_genome), Species)) %>%
+  mutate(Label = ifelse(is.na(Label), paste0("[", Genus, "]", "_", user_genome), Label))
+
+d_tax <- column_to_rownames(d_tax, "user_genome")
+
+annotations <- module_step_coverage_mat
+for (genome in rownames(annotations))
+{
+  for (module in colnames(annotations))
+  {
+    annotations[genome,module] = paste0("Name: ", d_tax[genome,"Label"],
+                       "\nPhylum: ",d_tax[genome,"Phylum"],
+                       "\nPathway: ", module_names[module_names$module== module,"module_name"]
+                       )
+  }
+}
+
+
+
+
+heatmaply(module_step_coverage_mat,
+          custom_hovertext = annotations,
+          showticklabels = c(FALSE,FALSE)
+          )
+
+view(annotations)
+view(module_step_coverage_mat)
+test.gen <-module_step_coverage_mat[d_tax[,"Phylum"]=="Patescibacteria",]
+test.abund <- otu_table(ps.rel) [d_tax[,"Phylum"]=="Patescibacteria",] 
+
+```
+
+```{r}
+kegg_count <- module_step_coverage_mat
+
+rowSums(kegg_count)
+
+```
+
+
+```{r, module_abundance}
+
+library(genefilter)
+library(RColorBrewer)
+library(pheatmap)
+library(Biobase)
+library(reshape2)
+
+
+# Sum of rel_ab for all species where a module is presence is equel to the matrix multiplication
+ps.rel <- transform_sample_counts(pst.count, function(x){x/sum(x)*100})
+
+rel_ab <- as(otu_table(ps.rel), "matrix") %>% t()
+
+module_presence_matrix <- module_presence_matrix[rownames(module_presence_matrix) %in% colnames(rel_ab),]
+
+stopifnot(dim(rel_ab)[2] == dim(module_presence_matrix)[1] )
+module_rel_ab <- rel_ab %*% module_presence_matrix
+
+sds <- rowSds(module_rel_ab)
+o <- order(sds, decreasing = TRUE)
+h_1 <- hclust(dist(module_rel_ab[o,]))
+h_2 <- hclust(dist(t(module_rel_ab[o,])))
+
+
+#Annotation data.frames
+##Row annotation
+anot.df <- data.frame(sample_data(ps.rel)) %>% dplyr:: select(treatment) %>% rename("Treatment" = treatment) %>% mutate(cols = ifelse(Treatment == "CT",
+"#0b7121", ifelse(Treatment == "BP",  "#ff0080",
+ifelse(Treatment == "DSS", "#45beff","#ff9500")))) 
+
+treat.col <- anot.df %>% dplyr::select(Treatment, cols) %>% distinct() 
+rownames(treat.col) <- NULL
+treat.col <- column_to_rownames(treat.col, "Treatment") %>% as.matrix()
+
+##Column annotation
+module.n <- module_names[module_names$module %in% colnames(module_rel_ab),]  
+rownames(module.n) <- NULL
+module.n <- module.n %>% column_to_rownames("module")
+colnames(module_rel_ab) <- module.n[rownames(module.n) %in% colnames(module_rel_ab), 1]
+
+heatie <- pheatmap(module_rel_ab, show_colnames = TRUE, Colv = as.dendrogram(h_2), Rolv = as.dendrogram(h_1),
+#annotation_col = module.n, 
+annotation_row = dplyr::select(anot.df, "Treatment"), 
+annotation_colors = list(Treatment = treat.col[,1]),
+angle_col = 45, fontsize = 8,  
+col = RColorBrewer::brewer.pal(11, "Spectral"), 
+cellwidth = 8, cellheight = 7, border_color = NA,
+main = "Relative abundance of genes in samples")
+
+ggsave(plot = heatie, limitsize = FALSE, "./outputs/heatmap/module.treat.jpeg", width = 29, height = 13, dpi = 300)
+
+
+```
+
+## Modules to phyloseq
+```{r, gene phyloseq}
+
+ps.gen <- phyloseq(otu_table(t(module_rel_ab), taxa_are_rows = TRUE), sample_data(pst.count))
+
+ps.log <- transform_sample_counts(ps.gen, function(x){log(x+1)})
+
+bray.pcoa = ordinate(ps.log, method="PCoA", distance = "bray")
+
+evals<-bray.pcoa$values$Eigenvalues
+
+plot_ordination(ps.log, bray.pcoa, color="treatment")+ 
+  geom_vline(xintercept = 0, lty = 2, color =  "black", alpha = 0.2) +
+  geom_hline(yintercept = 0, lty = 2, color =  "black", alpha = 0.2) +
+  geom_point(size = 6, pch = 21, color = "black") + 
+  theme_minimal() +
+  scale_color_manual(values = c(CT = "#12e2e9", BP = "#f605fa", DSS = "#042eff", DSSBP = "#ff9d00"))+
+  ggtitle(label = "PCoA plot", "log-transformed module rel_data") + 
+  stat_ellipse(aes(group = treatment, fill = treatment), show.legend = FALSE, type = "t",
+  level = 0.7, lty = 2, geom = "polygon", alpha = 0.1) + 
+  scale_fill_manual(values = c(CT = "#12e2e9", BP = "#f605fa", DSS = "#042eff", DSSBP = "#ff9d00")) +
+  theme(axis.text.x = element_text(size = 12), 
+  axis.text.y = element_text(size = 12), 
+  axis.title.x = element_text(face = "bold", size = 14),
+  axis.title.y = element_text(face = "bold", size = 14)) +
+  guides(color = guide_legend(order = 1, title = "Treatment groups",
+  title.theme = element_text(face = "bold")),
+  shape = guide_legend(order = 2, title = "Gender", title.theme = element_text( face = "bold"))) +
+geom_point(size = 5) + coord_fixed(sqrt(evals[2]/evals[1])) +
+labs(x = sprintf("PCo1 [%s%%]", round(evals/sum(evals)*100,1)[1]),
+     y = sprintf("PCo2 [%s%%]", round(evals/sum(evals)*100, 1)[2]))
+
+ggsave("./outputs/ordination/PCoA.bray.modules.jpeg", width = 10, height = 8, dpi = 300)
+
+# Bray NMDS
+bray.nmds <- ordinate(ps.gen, method = "NMDS", distance = "bray")
+
+wunifrac.stress = stressplot(bray.nmds)#in this dataset, R squared shows that the nMDS is perfectly able to capture variation in the data.
+
+
+#Adding segment lines to the centroids
+scrs <- scores(bray.nmds, "site")
+scrs <- cbind(as.data.frame(scrs), treatment = sample_data(ps.gen)$treatment)
+cent <- aggregate(cbind(NMDS1, NMDS2) ~ treatment, data = scrs, FUN = mean)
+segs <- merge(scrs, setNames(cent, c("treatment", "rNMDS1", "rNMDS2")),
+by = 'treatment', sort = FALSE)
+
+plot_ordination(ps.gen, bray.nmds, color = "treatment") +
+  geom_vline(xintercept = 0, lty = 2, color =  "black", alpha = 0.07) +
+  geom_hline(yintercept = 0, lty = 2, color =  "black", alpha = 0.07) +
+  theme_minimal()+ 
+geom_segment(data = segs, aes(xend = rNMDS1, yend = rNMDS2), color = "black", lty = 1, alpha = 0.2) +
+ geom_point(data = cent, pch = 21, fill = "red", color = "black", size = 2) + 
+geom_point(size = 6) +
+labs(col="Treatment gourp") + 
+xlab("NMDS1") + ylab ("NMDS2")+ 
+  scale_color_manual(values = c(CT = "#12e2e9", BP = "#f605fa", DSS = "#042eff", DSSBP = "#ff9d00"))+
+  ggtitle(label = "NMDS plot of bray", "non-transformed rel_data of gene modules") +
+  scale_fill_manual(values = c(CT = "#12e2e9", 
+  BP = "#f605fa", DSS = "#042eff", DSSBP = "#ff9d00")) +
+  theme(axis.text.x = element_text(size = 12), 
+  axis.text.y = element_text(size = 12), 
+  axis.title.x = element_text(face = "bold", size = 14),
+  axis.title.y = element_text(face = "bold", size = 14)) +
+  guides(color = guide_legend(order = 1, title = "Treatment groups",
+  title.theme = element_text(face = "bold")),
+  shape = guide_legend(order = 2, title = "Gender", title.theme = element_text( face = "bold"))) +
+  coord_fixed() 
+
+ggsave("./outputs/ordination/NMDS.bray.modules.jpeg", width = 10, height = 8, dpi = 300)
+```
+
+## 6.2. Beta diversity on the modules: dbrda
+```{r}
+library(vegan)
+
+
+ps.gen <- phyloseq(otu_table(t(module_rel_ab), taxa_are_rows = TRUE), sample_data(pst.count))
+ps.log <- transform_sample_counts(ps.gen, function(x){log(x+1)})
+
+
+bray.dist.log = phyloseq::distance(ps.log, method = "bray")
+bray.dist = phyloseq::distance(ps.gen, method = "bray")
+
+```
+
+### 6.2.1. Beta dispersion 
+```{r}
+df = data.frame(sample_data(ps.log ))
+df$pen2 <-factor(ifelse(df$pen %in% c("A1", "A2", "A3"), "A",
+ifelse(df$pen %in% c("B1", "B2", "B3"), "B",
+ifelse(df$pen %in% c("C1", "C2", "C3"), "C", "D"))), levels = c("A", "B", "C", "D"))
+df2 <- df %>% filter(!pig.no %in% c("P1", "P9", "P18"))# for the balanced design
+
+
+xtabs(~treatment + pen2, df)
+
+
+set.seed(10)
+
+# Making a permutational iteration to be passed on later to our betadisper permutation
+h <- with(data = df,
+  how(within = Within(type = "free"),
+  plots = Plots(strata = pen2, type = "none"),
+    blocks = round, nperm = 999))
+permute::check(df, control = h)#to check if the permutation plan is okay, e.g. balanced or not. and also the nr. of possible permutations
+
+
+bray.disp<- vegan::betadisper(bray.dist.log, group = df$treatment, 
+                                 type = "centroid")
+# Permutational test for analysis of variance with pairwise comparison.
+perm.disp <- vegan::permutest(bray.disp , permutation =h, pairwise = TRUE)
+(p.disp = perm.disp$tab$'Pr(>F)'[[1]])
+```
+
+```{r}
+library(glue)
+
+jpeg("./outputs/ordination/dispersion of variance_bray_log_modules.jpeg",  units = "cm",
+res = 200, height = 15, width = 20)
+
+plot(bray.disp, col = c(CT = "#12e2e9", 
+  BP = "#f605fa", DSS = "#042eff", DSSBP = "#ff9d00"),
+bty = "n", las = 1, main = "Dispersion of variance around the centroids of samples fo modules, Bray log", sub=NULL,
+  xlab = sprintf("PCo1 [%s%%]", round(bray.disp$eig[1]/sum(bray.disp$eig)*100)),
+ ylab = sprintf("PCo2 [%s%%]", round(bray.disp$eig[2]/sum(bray.disp$eig)*100)));text(glue("P = {round(p.disp, 3)}"), 
+ x = 0.06, y = -0.065, cex = 1.5, col = "red")
+
+dev.off()
+
+rm( perm.disp, p.disp)
+```
+
+### 6.2.2. dbrda: for treatment effect: here we allow shuffling observations coming from animals within, e.g. pen by passing on 'Within(type = "free")' and fix the animals by passing 'type = "none"' for plot.
+```{r}
+df <- df2
+bray_mat <- as.matrix(bray.dist.log)
+bray_mat <- bray_mat[rownames(df), rownames(df)]
+
+set.seed(1990)
+h <- with(data = df, 
+          how(within = Within(type = "none"),
+            plots = Plots(strata = pen2, type = "free"), 
+              blocks = round, nperm = 999))
+
+db.whole = vegan::dbrda(bray_mat ~ bp + dss + bp:dss + sex + Condition(litter+ round ), data = df)    #Full model, omnibus test
+anova(db.whole, permutations = h)
+
+dbrda.bray = vegan::dbrda(bray_mat ~ bp*dss + Condition(litter+ round + sex), 
+data = df)    # interaction/marginal effect
+anova(dbrda.bray, permutations = h, by = "margin")
+
+dbrda.bray = vegan::dbrda(bray_mat ~ bp + Condition(litter+ round + dss + sex), 
+ data = df) #main effect of bp
+anova(dbrda.bray, permutations = h, by = "margin")
+
+dbrda.bray = vegan::dbrda(bray_mat ~ dss + Condition(litter+ round + bp + dss),  data = df) #main effect of dss
+anova(dbrda.bray, permutations = h, by = "margin")
+
+dbrda.bray = vegan::dbrda(bray_mat ~ sex + Condition(litter+ round + bp + dss),  data = df) #main effect of sex
+anova(dbrda.bray, permutations = h, by = "margin")
+
+
+```
+
+
+### 6.2.3. Plotting from model scores
+```{r}
+
+# Extreacting the goodies :)
+score.site = vegan::scores(db.whole, display = "sites") %>% data.frame
+score.site <- cbind(as.data.frame(score.site), treatment = df$treatment)
+
+#cetnroids
+cent <- aggregate(cbind(dbRDA1, dbRDA2) ~ treatment, data = score.site, FUN = mean)
+
+segs <- merge(score.site, setNames(cent, c("treatment", "dbrda1", "dbrda2")),
+by = 'treatment', sort = FALSE)
+
+eig.vals = db.whole$CCA$eig
+inertia.total = db.whole$tot.chi #Total variation (inertia) explained. This number should be used as the denominator for measuring the amount of variance out of totoal variance wxplained by each dbrda axis.
+
+#Ordination Plot
+score.site %>% ggplot(aes(dbRDA1, dbRDA2, 
+                          color = df$treatment)) +
+geom_hline(yintercept = 0, lty = 2, alpha =0.5) + 
+geom_vline(xintercept = 0, lty = 2, alpha = 0.5) +
+geom_segment(data = segs, aes(xend = dbrda1, yend = dbrda2), color = "black", lty = 1, alpha = 0.2) +
+ geom_point(data = cent, pch = 21, fill = "red", color = "black", size = 2) +
+geom_point(size = 7) + 
+coord_fixed(sqrt(eig.vals[2]/eig.vals[1]))  + 
+scale_color_manual(values = c(CT = "#12e2e9", 
+  BP = "#f605fa", DSS = "#042eff", DSSBP = "#ff9d00")) + 
+theme_minimal() + 
+scale_y_continuous(na.value = c(-2, 3), n.breaks = 10) +
+scale_x_continuous(na.value = c(-1, 1), n.breaks = 10) + 
+labs(col="Treatment", shape = "Gender") + 
+xlab(label = paste("dbRDA1 [", round(eig.vals[[1]]/sum(eig.vals)*100, 1),"% of fitted and", 
+                    round(eig.vals[[1]]/inertia.total*100, 1), 
+                    "% of total variation]")) + 
+ylab(label = paste("dbRDA2 [", round(eig.vals[[2]]/sum(eig.vals)*100, 1),"% of fitted and", round(eig.vals[[2]]/inertia.total*100, 1),"% of total variation]")) + 
+theme(axis.title = element_text(size = 9), 
+text = element_text(size = 13, face = "bold"),
+    axis.text.x =element_text(size =10, face = "bold"),
+axis.text.y =element_text(size =10, face = "bold")) + 
+ggtitle(label = "dbRDA plot of scores for sample, bray", "Log transformed gene modules")  + 
+#stat_ellipse(data = score.site, aes(dbRDA1, dbRDA2 ,fill = df$treatment, color = df$treatment), show.legend = F, inherit.aes = F, alpha = 0.2, position = "jitter", type = "euclid",  linetype = 3,  geom = "polygon", level = 0.2, segments =50 ) + 
+scale_fill_manual(values = c(CT = "#12e2e9", 
+  BP = "#f605fa", DSS = "#042eff", DSSBP = "#ff9d00")) + 
+  guides(color = guide_legend(order = 1))
+
+ggsave("./outputs/ordination/bray.dbRDA.scores.modules.jpeg", height = 8, width = 9, dpi =300)
+
+rm(db.whole, db.whole.main, db.whole.margin, score.site, eig.vals, inertia.total)
+```
+
+# 7. Differential abundance analysis for taxa: we use the raw counts
+```{r}
+library(DESeq2)
+#Species
+spec.ps <- gloomer(pst.count, "Species", TRUE)          
+spec <- tax_glom(pst.count, "Species", FALSE)
+         
+spec_dds <- phyloseq_to_deseq2(spec, design = ~ bp + dss + bp:dss + round + sex) 
+
+#calculate geometric means prior to estimate size factors
+gm.mean = function(x, na.rm= TRUE) {
+    exp(sum(log(x[x>0]), na.rm=na.rm)/length(x))
+}
+
+geo.mean = apply(counts(spec_dds), 1, gm.mean)
+
+spec_dds = estimateSizeFactors(spec_dds, geoMeans = geo.mean)#size factor with geometric mean
+spec_dds<-DESeq(spec_dds, test = "Wald", fitType = "parametric")
+spec.red <- nbinomLRT(spec_dds,  reduced = ~ bp + dss + bp : dss + round) # sex had no effect
+
+results(spec.red) %>% data.frame() %>% filter(padj <=0.05)#sex had no effect, and round had effect on only one species
+
+#updating the design
+design(spec_dds) <- ~ bp + dss + bp : dss + round
+spec_dds <-DESeq(spec_dds, test = "Wald", fitType = "parametric")
+```
+
+```{r}
+#Test for outliers
+spec.res<-results(spec_dds, cooksCutoff = FALSE)
+
+alpha=0.05
+
+sigtab= spec.res[which(spec.res$padj<=alpha),]
+
+sigtab.spec=cbind(as(sigtab, "data.frame"), as(tax_table(spec.ps)[rownames(sigtab),], "matrix"))
+
+all(rowMeans(counts(spec_dds, normalized = TRUE, replaced = TRUE))==spec.res$baseMean) #if there were outliers, it should have returned FALSE
+
+``` 
+
+```{r}
+
+resultsNames(spec_dds)
+
+#Interactions effects
+bp.dss = results(spec_dds,  contrast= c(0,0,0,0,0,1), lfcThreshold = 0) %>% data.frame %>% filter(padj < 0.05) #no interaction
+
+inter.sig = rownames(bp.dss)#taxa that with significant interaction
+
+spec_dds = spec_dds[!rownames(spec_dds) %in% inter.sig]
+
+#main effect of bp
+bp.main = results(spec_dds, contrast =  c(0,1,0,0,0,0.5), lfcThreshold = 0) %>% data.frame %>% filter(padj < 0.05) #BP had no effect
+
+dss.main = results(spec_dds, contrast = c(0,0,1,0,0,0.5), lfcThreshold = 0) %>% data.frame %>% filter(padj < 0.01)
+
+```
+
+```{r}
+#plotting for the Species and Phylum for DSS main
+
+spec.taxa = tax_table(spec.ps)[rownames(tax_table(spec.ps))%in% 
+                                            rownames(dss.main),] %>% as.data.frame()
+sigtabspec = cbind(as(dss.main, "data.frame"), as(spec.taxa, "data.frame"))
+
+#a costumized color scheme
+
+phylcol= c("#d4ff00",'springgreen3','snow3','#545454', 'cadetblue', '#e3440f',
+              '#e8530f','deeppink2','orangered', '#1100cf', 'red','limegreen',
+            'cyan1','darkmagenta', 'purple', 'cyan4', 'gold')
+ 
+colindex = data.frame(color = phylcol[1:length(unique(tax_table(spec.ps)[,2]))], phylum = sort(unique(tax_table(spec.ps)[,2])))
+
+phyla = unique(data.frame(tax_table(spec.ps)[,2])) %>% pull
+colors = c()
+for(i in phyla){
+  colors[i] = colindex[colindex$Phylum == i,1]
+    }
+
+sigtabspec = sigtabspec[abs(sigtabspec$log2FoldChange)>2,]
+# Phylum order
+
+x = tapply(sigtabspec$log2FoldChange, sigtabspec$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabspec$Phylum = factor(as.character(sigtabspec$Phylum), levels=names(x))
+
+#Species reorder
+x = tapply(sigtabspec$log2FoldChange, sigtabspec$Species, function(x) max(x))
+x = sort(x, TRUE)
+sigtabspec$Species = factor(as.character(sigtabspec$Species), levels=names(x))
+
+range(sigtabspec$log2FoldChange)
+
+ggplot(sigtabspec, aes(y=Species, x=log2FoldChange), stroke = 0.5) +
+ geom_vline(xintercept = 0.0, color = "orange", size = 0.5, lty = 2) +
+  geom_point(aes(fill = Phylum), alpha = 0.8, 
+             size = 12, color = "black", 
+             shape = 21, stroke = 0.5) + theme_bw()+ 
+geom_text(aes(label = round(log2FoldChange,2)), size = 3 )+
+ theme(legend.text = element_text(face = "bold"),
+      axis.text.x = element_text(angle = 0, 
+      hjust = 0, vjust=0.5, size = 12, face = "bold"),
+      axis.text.y = element_text(size = 14, face = "italic"), 
+      title = element_text(face = "bold"),
+      axis.title.y = element_text(size = 12, face = "bold") )+
+      ggtitle("Log2FoldChange of Species as main effect of DSS") + 
+     scale_x_continuous(limits = c(-26, 24),n.breaks = 10) + 
+           scale_y_discrete(expand = c(0.0005,0.9)) + 
+            scale_fill_manual(values = colors[names(colors)%in% sigtabspec$Phylum]) + 
+            ylab("Species") 
+
+ggsave("./outputs/DESeq2/difabund_spec_dss_main.jpeg", device = "jpeg", dpi  = 300, height =15, width = 9)
+```
+
+
+```{r}
+library(ggrepel)
+
+#Volcano plot
+dss.main = results(spec_dds, contrast = c(0,0,1,0,0,0.5), lfcThreshold = 0) %>% data.frame 
+spec.taxa = tax_table(spec.ps)[rownames(tax_table(spec.ps))%in% 
+                                            rownames(dss.main),] %>% as.data.frame()
+sigtabspec = cbind(as(dss.main, "data.frame"), as(spec.taxa, "data.frame"))
+
+sigtabspec = sigtabspec %>% filter(pvalue != "NA", padj != "NA")
+alpha = 0.05
+
+sigtabspec$Significant = ifelse(sigtabspec$padj <= alpha, paste0("FDR < ", alpha), "Not Sig") %>% 
+factor(levels = c("FDR < 0.05", "Not Sig"))
+
+
+sigtabspec %>% group_by(log2FoldChange) %>% arrange(desc(log2FoldChange)) %>% 
+ggplot(aes(x = log2FoldChange, y = -log10(pvalue), label = Species)) + 
+geom_hline(yintercept = -log10(sigtabspec[sigtabspec$Significant == "Not Sig","pvalue"])  %>%  max, color = "red", alpha = 0.5, lty = 2) +
+geom_vline(xintercept = 0, color = "black", alpha = 0.3)  +
+geom_point(data = sigtabspec[sigtabspec$Significant == "Not Sig",], 
+           aes(x = log2FoldChange, y = -log10(pvalue)), 
+           color = "#ff00b3", alpha = 0.8,  size = 2)  + 
+theme_bw(base_size = 12) + 
+theme(legend.position= "right", 
+      text = element_text(size = 15, face = "bold")) + 
+geom_point(data = sigtabspec[sigtabspec$Significant == "FDR < 0.05",],
+    aes(x = log2FoldChange, y = -log10(pvalue), 
+        fill = Phylum), size = 4, alpha = 1,  
+        color = "black", shape = 21, stroke = 0.5) +  
+scale_fill_manual(values = colors[names(colors)%in% 
+                sigtabspec[sigtabspec$Significant == "FDR < 0.05", "Phylum"]]) +
+geom_text_repel( nudge_y = 0.15, nudge_x = -.5, 
+               data= top_n(sigtabspec[sigtabspec$Significant == "FDR < 0.05" & sigtabspec$log2FoldChange < -4,], 
+               n =  -20, wt = pvalue), #- means the lowest p.value (hihger significant)
+               aes(label = Species), 
+               size = 2, 
+               box.padding = unit( 0.4, units ="lines"),
+               point.padding = unit(0.4, "lines"), max.overlaps = 20)  + 
+geom_text_repel(nudge_y = 0, nudge_x =0.5, 
+               data= top_n(sigtabspec[sigtabspec$Significant == "FDR < 0.05" & sigtabspec$log2FoldChange > 4,],
+               -20, pvalue), #- means the lowest p.value (hihger significant)
+               aes(label = Species), size = 2, 
+               box.padding = unit( 0.4, units ="lines"),
+               point.padding = unit(0.4, "lines"), max.overlaps = 20)+
+geom_text( aes(x = -20, y =0, label = "Not Sig"), color = "#001eff", size = 3) +
+geom_text(aes(x = -20, y =2.1, label = "FDR < 0.05"), color = "#001eff", size = 3)+ 
+ggtitle (label = "Volcano Plot of the top 10 most significant log2FoldChange Speicies", "Main effect of DSS") + 
+scale_y_continuous(limits = c(0, 27), n.breaks = 5) + 
+scale_x_continuous(limits = c(-25, 24), n.breaks = 10) + 
+guides(size = "none") 
+
+ggsave("./outputs/DESeq2/difabund_spec_dss_main_volcano.jpeg", device = "jpeg", dpi  = 300, height = 9, width = 9)
+```
+
+## 7.1. Differential abundant genes (modules)
+```{r}
+gen_dds <- phyloseq_to_deseq2(ps.gen, design = ~ bp + dss + bp:dss + round + sex) 
+
+#calculate geometric means prior to estimate size factors
+gm.mean = function(x, na.rm= TRUE) {
+    exp(sum(log(x[x>0]), na.rm=na.rm)/length(x))
+}
+
+geo.mean = apply(counts(gen_dds), 1, gm.mean)
+
+gen_dds = estimateSizeFactors(gen_dds, geoMeans = geo.mean)#size factor with geometric mean
+gen_dds<-DESeq(gen_dds, test = "Wald", fitType = "local")
+gen.red <- nbinomLRT(gen_dds,  reduced = ~ bp + dss + bp : dss + sex ) #round had no effect
+
+results(gen.red) %>% data.frame() %>% filter(padj <=0.05)#sex had no effect, and round had effect on only one species
+
+#updating the design
+design(gen_dds) <- ~ bp + dss + bp : dss + sex + round
+gen_dds <-DESeq(gen_dds, test = "Wald", fitType = "local")
+```
+
+```{r}
+#Test for outliers
+gen.res<-results(gen_dds, cooksCutoff = FALSE)
+
+
+alpha=0.05
+
+sigtab = gen.res[which(gen.res$padj<=alpha),]
+
+sigtab.gene = cbind(as(sigtab, "data.frame"), as(tax_table(gen.res)[rownames(sigtab),], "matrix"))
+
+all(rowMeans(counts(gen_dds, normalized = TRUE, replaced = TRUE)) == gen.res$baseMean) #if there were outliers, it should have returned FALSE
+
+``` 
+
+```{r}
+
+resultsNames(gen_dds)
+
+#Interactions effects
+bp.dss = results(gen_dds, contrast = c(0,0,0,0,0,0,1),lfcThreshold = 0) %>% data.frame %>% filter(padj < 0.05) #no interaction
+
+#main effect of bp
+bp.main = results(gen_dds, contrast = c(0,1,0,0,0,0,0.5) , lfcThreshold = 0) %>% data.frame %>% filter(padj < 0.05) #BP had no effect
+
+dss.main.module = results(gen_dds, contrast = c(0,0,1,0,0,0,0.5), lfcThreshold = 0) %>% data.frame %>% filter(padj < 0.05)
+
+
+
+modules_dss <- kegg_modules[kegg_modules$module_name %in% rownames(dss.main),] %>% data.frame() %>% select(genome, module, module_name, 8,9) 
+
+
+
+
+```
+
+### 7.1.1. Relating genome to functions
+```{r}
+dss.main.spec = results(spec_dds, contrast = c(0,0,1,0,0,0.5), lfcThreshold = 0) %>% data.frame %>% filter(padj < 0.01)
+
+species.dss <- tax_table(pst.count)[tax_table(pst.count)[,7] %in% rownames(dss.main.spec),] %>% data.frame() %>% pull(Species) 
+
+uknown <- dss.main.spec[!rownames(dss.main.spec) %in% species.dss,] %>% rownames()
+
+pull_names <- c("Blautia", "Ruminococcus", "Butyricicoccus", "CAG-110", "UBA7001", "UBA3700", "Terrisporobacter", "Zag111", "RC9", "RF16", "Prevotella", "Parabacteroides", "Treponema", "UBA5920")
+
+known <- tax_table(pst.count)[tax_table(pst.count)[,7] %in% species.dss,] %>% data.frame() %>%select(Genus ,Species) %>% rownames_to_column("genome")
+
+
+junk <- tax_table(spec)[rownames(tax_table(spec)) %in% rownames(dss.main2),] %>% data.frame() %>% select(Genus, Species)
+
+diff_spec_dss <- rbind(data.frame(junk[junk$Genus %in% pull_names,] %>% filter(is.na(Species)) %>% select(Genus) %>% rownames_to_column("genome"), Species = uknown), known)
+
+module_step_coverage_mat_dss <- module_step_coverage_mat[rownames(module_step_coverage_mat) %in% diff_spec_dss$genome,]
+
+module_step_coverage_mat_dss[colnames(module_step_coverage_mat_dss) == "M00133",]
+
+
+
+modules_dss = modules_dss[modules_dss$genome %in% diff_spec_dss$genome,]
+unique(modules_dss$module_name)
+metabolism <- c("Carbohydrate metabolism", "Amino acid metabolism", "Amino acid metabolism",
+"Metabolism of cofactors and vitamins", "Metabolism of cofactors and vitamins", "Amino acid metabolism", "Energy metabolism", "Energy metabolism", "Energy metabolism", "Gene set")
+
+dss_modules_diff <- data.frame(Pathway =metabolism, dss.main.module)
+
+```
+
+
+```{r}
+#plotting for the modules 
+
+
+#a costumized color scheme
+
+pathcol= c('#cd9300','#1cc506','deeppink2','#8e0000', '#1100cf',
+            'cyan1','darkmagenta', '#4a4b4e', 'cyan4', 'gold')
+
+paths =unique(dss_modules_diff$Pathway)
+
+colindex = data.frame(color = pathcol[1:length(paths)], pathways = paths)
+
+colors = c()
+for(i in paths){
+  colors[i] = colindex[colindex$pathways == i,1]
+    }
+
+dss_modules_diff <- dss_modules_diff %>% rownames_to_column("modules")
+
+x = tapply(dss_modules_diff$log2FoldChange, dss_modules_diff$modules, function(x) max(x))
+x = sort(x, TRUE)
+dss_modules_diff$modules = factor(as.character(dss_modules_diff$modules), levels=names(x))
+
+
+
+ggplot(dss_modules_diff, aes(y=modules, x=log2FoldChange), stroke = 0.5) +
+ geom_vline(xintercept = 0.0, color = "orange", size = 0.5, lty = 2) +
+  geom_point(aes(fill = Pathway), alpha = 0.8, 
+             size = 15, color = "black", 
+             shape = 21, stroke = 0.5) + theme_bw()+ 
+geom_text(aes(label = round(log2FoldChange,2)), size = 3 )+
+ theme(legend.text = element_text(face = "bold"),
+      axis.text.x = element_text(angle = 0, 
+      hjust = 0, vjust=0.5, size = 12, face = "bold"),
+      axis.text.y = element_text(size = 14, face = "bold"), 
+      title = element_text(face = "bold"),
+      axis.title.y = element_text(size = 12, face = "bold") )+
+      ggtitle("Log2FoldChange of modules as main effect of DSS") + 
+     scale_x_continuous(limits = c(-25, 2),n.breaks = 10) + 
+          scale_y_discrete(expand = c(0.0005,0.4)) + 
+            scale_fill_manual(values = colors[names(colors)%in% dss_modules_diff$Pathway]) + 
+            ylab("KEGG modules") 
+
+ggsave("./outputs/DESeq2/difabund_module_dss_main.jpeg", device = "jpeg", dpi  = 300, height =8, width = 14)
+```
+
+# 8. Making a heatmap of association between changed genome, module and chemicals
+```{r}
+library(genefilter)
+library(RColorBrewer)
+library(pheatmap)
+library(Biobase)
+library(reshape2)
+
+
+#Modules
+diff_spec_dss
+dss_modules_diff
+
+dss_module_name <- module_names[module_names$module_name %in% dss_modules_diff$modules, 1]
+module_rel_dss <- module_rel_ab[,colnames(module_rel_ab) %in% dss_module_name] 
+
+log_module = apply(module_rel_dss, 2, function(x) log(x + 1))
+
+#Taxa
+ps.spec <- gloomer(pst.count, "Species", TRUE)
+rel.spec <- transform_sample_counts(ps.spec, function(x){x/sum(x)*100})
+rel.spec <- filter_taxa(ps.spec, function(x) sum(x>0)>0,TRUE)
+
+rel.spec <- transform_sample_counts(rel.spec, function(x){log(x+1)})
+asv.spec = as(otu_table(rel.spec )[ , colnames(rel.spec@otu_table) %in% rownames(log_module)], "matrix")       
+asv.spec = asv.spec[!rownames(asv.spec) %in% 
+c("Unknown", "uncultured", "Uncultured", "Unassigned", "NA"),] %>% t()
+
+asv.spec = asv.spec[, colnames(asv.spec) %in% diff_spec_dss$Species]#only species differentially changed by dss
+
+#chemical data               
+chem_dig <- chem_dat[chem_dat$sample_type == "Distal",] %>% dplyr::select( 8:30) 
+index <- paste0("S", seq(1,24))
+index = index[index!="S12"]
+rownames(chem_dig) <- NULL
+rownames(chem_dig) <- index
+
+
+colnames(chem_dig)[17] <- "L.tryptophan"
+colnames(chem_dig)[19] <- "Indol.3.propionate"
+colnames(chem_dig)[20] <- "4.methylphenol"
+colnames(chem_dig)[21] <- "1.benzopyrrol" 
+chem_dig <- as.matrix(chem_dig)
+
+
+chem_dig = apply(chem_dig, 2, function(x) log(1+x))
+#reorder rownames to the taxa 
+chem_dig <- chem_dig[rownames(asv.spec),]
+
+```
+
+## 8.1. Corelation  for chemicals and taxa
+```{r}
+#cor chem taxa for digesta
+
+cor_main_chem_taxa = Hmisc::rcorr(chem_dig, asv.spec,  type = "spearman")
+
+cor_chem_taxa = cor_main_chem_taxa$r[rownames(cor_main_chem_taxa$r) %in% colnames(chem_dig) , colnames(cor_main_chem_taxa$r) %in% colnames(asv.spec)] 
+cor_chem_taxa = cor_chem_taxa[complete.cases(cor_chem_taxa),]
+
+#Pvals chem taxa (ct)
+
+cor_pval_ct = cor_main_chem_taxa$P[rownames(cor_main_chem_taxa$P) %in% colnames(chem_dig), colnames(cor_main_chem_taxa$P) %in% colnames(asv.spec)] 
+
+cor_pval_ct = cor_pval_ct[complete.cases(cor_pval_ct),]
+
+cor_qval = p.adjust(cor_pval_ct , method = "BH")
+cor_qval_ct = matrix(cor_qval, nrow = nrow(cor_pval_ct) , ncol = ncol(cor_pval_ct))
+rownames(cor_qval_ct ) <- rownames(cor_pval_ct)
+colnames(cor_qval_ct) <- colnames(cor_pval_ct) 
+
+#checking for na
+any(is.na(cor_qval_mt))
+
+q_vals = matrix(cor_qval_ct, ncol = ncol(cor_pval_ct), nrow = nrow(cor_pval_ct), dimnames = list(rownames(cor_pval_ct), colnames(cor_pval_ct))) %>% t()
+
+df1 = melt(round(cor_chem_taxa,2))
+df2 = melt(t(q_vals))
+sigs_ct <- left_join(df1, df2, by = c("Var1", "Var2")) %>% mutate(sigs = ifelse(value.y <= 0.05, value.x, "")) %>% dplyr::select(Var1, Var2, sigs) %>% pivot_wider(names_from = Var2, values_from = sigs) %>% data.frame() %>% column_to_rownames("Var1") %>% as.matrix() %>% t()
+
+rownames(sigs_ct)<- rownames(q_vals)
+
+cor_chem_taxa[rownames(cor_chem_taxa) == "Propionate", colnames(cor_chem_taxa) == "[Treponema]_unknown"]
+```
+
+## 8.2. Corelation  for chemicals and modules
+```{r}
+#cor chem and modlues for digesta
+
+cor_main_chem_module = Hmisc::rcorr(chem_dig, log_module,  type = "spearman")
+
+cor_chem_m = cor_main_chem_module$r[rownames(cor_main_chem_module$r) %in% colnames(log_module) , colnames(cor_main_chem_module$r) %in% colnames(chem_dig)] 
+
+cor_chem_m = cor_chem_m[complete.cases(cor_chem_m),]
+
+rownames(cor_chem_m) <- module_names[module_names$module %in% dss_module_name, "module_name"]
+
+#Pvals chem module (cm)
+
+cor_pval_cm = cor_main_chem_module$P[rownames(cor_main_chem_module$P) %in% colnames(log_module), colnames(cor_main_chem_module$P) %in% colnames(chem_dig)] 
+
+cor_pval_cm = cor_pval_cm[complete.cases(cor_pval_cm),]
+rownames(cor_pval_cm) <- module_names[module_names$module %in% dss_module_name, "module_name"]
+
+cor_qval = p.adjust(cor_pval_cm , method = "BH")
+cor_qval_cm = matrix(cor_qval, nrow = nrow(cor_pval_cm) , ncol = ncol(cor_pval_cm))
+rownames(cor_qval_cm ) <- rownames(cor_pval_cm)
+colnames(cor_qval_cm) <- colnames(cor_pval_cm) 
+
+#checking for na
+any(is.na(cor_qval_mt))
+
+q_vals = matrix(cor_qval_cm, ncol = ncol(cor_pval_cm), nrow = nrow(cor_pval_cm), dimnames = list(rownames(cor_pval_cm), colnames(cor_pval_cm))) %>% t()
+
+df1 = melt(round(cor_chem_m,2))
+df2 = melt(t(q_vals))
+sigs_cm <- left_join(df1, df2, by = c("Var1", "Var2")) %>% mutate(sigs = ifelse(value.y <= 0.05, value.x, "")) %>% dplyr::select(Var1, Var2, sigs) %>% pivot_wider(names_from = Var2, values_from = sigs) %>% data.frame() %>% column_to_rownames("Var1") %>% as.matrix() %>% t()
+
+rownames(sigs_cm)<- rownames(q_vals)
+```
+
+## 8.3. correlation for taxa and modlues
+```{r}
+#cor taxa and module
+cor_main_module_taxa = Hmisc::rcorr(asv.spec, log_module, type = "spearman")
+
+cor_module_taxa = cor_main_module_taxa$r[rownames(cor_main_module_taxa$r) %in% colnames(log_module) , colnames(cor_main_module_taxa$r) %in% colnames(asv.spec)] 
+cor_module_taxa = cor_module_taxa[complete.cases(cor_module_taxa),]
+
+rownames(cor_module_taxa) <- module_names[module_names$module %in% dss_module_name, "module_name"]
+
+#Pvals module taxa (MT)
+
+cor_pval_mt = cor_main_module_taxa$P[rownames(cor_main_module_taxa$P) %in% colnames(log_module), colnames(cor_main_module_taxa$P) %in% diff_spec_dss$Species] 
+rownames(cor_pval_mt) <- module_names[module_names$module %in% dss_module_name, "module_name"]
+
+cor_pval_mt = cor_pval_mt[complete.cases(cor_pval_mt),]
+
+cor_qval = p.adjust(cor_pval_mt , method = "BH")
+cor_qval_mt = matrix(cor_qval, nrow = nrow(cor_pval_mt) , ncol = ncol(cor_pval_mt))
+rownames(cor_qval_mt ) <- rownames(cor_pval_mt)
+colnames(cor_qval_mt) <- colnames(cor_pval_mt) 
+
+#checking for na
+any(is.na(cor_qval_mt))
+
+q_vals = matrix(cor_qval_mt, ncol = ncol(cor_pval_mt), nrow = nrow(cor_pval_mt), dimnames = list(rownames(cor_pval_mt), colnames(cor_pval_mt))) %>% t()
+
+df1 = melt(round(cor_module_taxa,2))
+df2 = melt(t(q_vals))
+sigs_mt <- left_join(df1, df2, by = c("Var1", "Var2")) %>% mutate(sigs = ifelse(value.y <= 0.05, value.x, "")) %>% dplyr::select(Var1, Var2, sigs) %>% pivot_wider(names_from = Var2, values_from = sigs) %>% data.frame() %>% column_to_rownames("Var1") %>% as.matrix() %>% t()
+
+rownames(sigs_mt)<- rownames(q_vals)
+
+cor_module_taxa[rownames(cor_module_taxa) == "Nitrogen fixation, nitrogen => ammonia", colnames(cor_module_taxa) == "[Treponema]_unknown"]
+
+#Adding significance signs to the qval matrix
+
+#q.vals[cor.qval <0.05] = "*"
+#q.vals[cor.qval >= 0.05] = ""
+
+```
+
+## 8.4. Plotting the heatmap: this can be repeated for all association matices
+```{r}
+library(RColorBrewer)
+#Creating a biostringset
+cor_mat = t(as(cor_chem_m,"matrix"))#in the aassay dataset, we add our correlation matrix instead of the abundance matrix
+taxdat <- data.frame(tax_table(ps.spec)[rownames(ps.spec@tax_table) %in% rownames(cor_mat)])
+
+
+taxadat = Biobase::AnnotatedDataFrame(taxdat)#taxa table
+
+x = ExpressionSet(assayData = cor_mat,  
+               # featureData = taxadat
+                  )
+
+
+
+
+#first we chose the top 100 most variable asvs in the dataset and define a function rowCenter that centers each asv by subtracting the mean acorss columns. 
+sds <- rowSds(Biobase::exprs(x))
+o <- order(sds, decreasing = TRUE)
+h_1 <- hclust(dist(Biobase::exprs(x)[o,]), method = "ward.D2")
+h_2 <- hclust(dist(t(Biobase::exprs(x)[o,])), method = "ward.D2")
+
+#making a phylum annotation and it only accepts one column dataframe
+col.annot = fData(x)[rownames(fData(x)) %in% rownames(Biobase::exprs(x)[o,]),] %>% dplyr::select(Phylum, Genus)
+
+#making color index for the phylum annotation 
+
+phylcol=c('#fe0909', 'cyan','#297168', '#2c3836', 'cornflowerblue', 'plum4',
+          'darkgoldenrod3','aquamarine4', 'cadetblue2', 'red', 'darkblue', 'Maroon', 'Gray',
+        'steelblue2','darkmagenta', 'antiquewhite4', "darkorange", 'darkgreen')
+
+phyl.col = data.frame(Phylum = unique(col.annot[,1]), phyl.col = phylcol[1:5])
+
+phyl.col = column_to_rownames(phyl.col, "Phylum") %>% as.matrix
+
+#making a color index for the Genus annotation
+gen.col <- list(RColorBrewer::brewer.pal(7, name = "Set1"), RColorBrewer::brewer.pal(8, "Accent"), 
+     RColorBrewer::brewer.pal(8, "Dark2"), RColorBrewer::brewer.pal(8, "Set2")) %>% unlist
+
+genie <- data.frame(Genus = unique(taxdat$Genus), gen.col = gen.col)
+
+gencol <- c()
+
+for(i in unique(taxdat$Genus)){
+  gencol[i] <- genie[genie$Genus == i, "gen.col"]
+}
+
+#row color for modules
+pathcol= c('#1d04ff','#4d90ad','#3f3f40','#c108a2', '#fff700',
+            'cyan1','darkmagenta', '#4a4b4e', 'cyan4', 'gold')
+
+paths =unique(dss_modules_diff$Pathway)
+
+colindex = data.frame(color = pathcol[1:length(paths)], pathways = paths)
+
+colors.path = c()
+for(i in paths){
+  colors.path[i] = colindex[colindex$pathways == i,1]
+    }
+#row annot
+row.annot <- dss_modules_diff %>% dplyr::select(modules, Pathway) %>% column_to_rownames("modules")
+
+
+#making sig table 
+mat <- t(Biobase::exprs(x)[o,])
+df1 <- Biobase::exprs(x)[o, ] %>% data.frame() %>% rownames_to_column("Species")
+
+df2 <- sigs_ct[rownames(sigs_ct) %in% 
+        rownames(Biobase::exprs(x)[o,]), ] %>% 
+        data.frame() %>% rownames_to_column("Species") 
+
+sig.df <- left_join(df1, df2, by = "Species") %>%
+dplyr::select(1,25:47) %>% column_to_rownames("Species")
+
+colnames(sig.df) <- colnames(sigs_ct)
+sig.df <- t(sig.df)
+
+#color pallet for the heatmap
+pallet <- c("#24956e", "#faeaea", "#f45b03") 
+pallet <- c("#00d9ff", "#cac3c3", "#fbff00") 
+pallet <- c("#feb414", "#cac3c3","#1f725d" ) 
+pal <- colorRampPalette(pallet)(9)
+
+
+#reordering the modlues and significant matrix based on the pathway alphabet
+mat <- t(Biobase::exprs(x))
+row.df <- row.annot %>% data.frame() %>% rownames_to_column("module")
+row.sorted <- row.df %>% group_by(Pathway) %>% arrange(.by_group = TRUE) %>% column_to_rownames("module") %>% as.matrix()
+mat <- mat[rownames(row.sorted),] 
+sig.df <- sigs_cm[colnames(mat), rownames(mat)] %>% t()
+
+
+#Plot
+pheat_cm = pheatmap(mat = mat, 
+                      angle_col = 45,
+                      cluster_rows = FALSE, 
+                      legend_breaks = seq(from = -0.8, to = 0.8, 0.20),
+                      annotation_colors = list(#Phylum = phyl.col[,1], 
+                     # Genus = gencol, 
+                      Pathway = colors.path[order(names(colors.path))]
+                      ), #to reorder the pathways legend
+                      border_color = NA, 
+                      #annotation_col = col.annot%>% dplyr::select(1),
+                      annotation_row = data.frame(row.annot) %>% dplyr::select(Pathway) %>% arrange(Pathway), 
+                      cellwidth = 22, cellheight = 20, cutree_cols = 4, number_color = "black",
+                      display_numbers = sig.df, fontsize_number = 8,
+                      #cluster_cols = h_1, 
+                      cluster_cols = FALSE,
+                      col = pal,
+                      #col = RColorBrewer::brewer.pal(11, "Spectral"), 
+                      main = "Heat map of spearman correlation between Co3 chemicals and 10 modules differed in dss")
+
+ggsave(plot = pheat_cm, filename = "./outputs/heatmap/heatmap.modules.cheimicals.distal.jpeg", device = "jpeg", dpi = 300, height = 8, width = 18)
+
+
+```
+
+
+## 8.5. Heatmap correlation of significant for modules and taxa with blood and chemicals
+```{r}
+#species differentiated by dss
+diff_spec_dss 
+#modules differentiated by dss
+dss_modules_diff 
+dss_module_name <- module_names[module_names$module_name %in% dss_modules_diff$modules, 1]
+module_rel_dss <- module_rel_ab[,colnames(module_rel_ab) %in% dss_module_name] 
+
+#chemical and blood data
+chemdat <- sample_data(pst.count) %>% data.frame() %>% dplyr::select(16:26, 32:53) 
+chemdat$Indoles <- rowSums(chemdat[, colnames(chemdat)[27:32]] )
+
+chemdat <- chemdat %>% dplyr::select(1:26,34, 27:33)
+colnames(chemdat)[28] <- "L.tryptofan"
+colnames(chemdat)[29] <- "Indol.3.acetate"
+colnames(chemdat)[30] <- "Indol.3.propionate"
+colnames(chemdat)[31] <- "4.methylphenol"
+colnames(chemdat)[32] <- "1.benzopyrrol" 
+colnames(chemdat)[2:11] <- c("Red blood cells", "Haemoglobin", "Haematocrit", "Plattlets", "White blood cells", "Neutrophils", "Lymphocytes", "Monocytes", "Eosinophils", "Basophils")
+
+#species data
+ps.spec <- gloomer(pst.count, "Species", TRUE)
+rel.spec <- transform_sample_counts(ps.spec, function(x){x/sum(x)*100})
+rel.spec <- filter_taxa(ps.spec, function(x) sum(x>0)>0,TRUE)
+rel.spec <- transform_sample_counts(rel.spec, function(x){log(1+x)})
+
+#log modules
+log_module = apply(module_rel_dss, 2, function(x) log(1+x))
+colnames(log_module) <- module_names[module_names$module %in% colnames(log_module), 2]
+
+asv.spec = as(otu_table(rel.spec)[rownames(otu_table(rel.spec)) %in%  diff_spec_dss$Species,colnames(rel.spec@otu_table) %in% rownames(log_module)], "matrix")       
+
+asv.spec = asv.spec[!rownames(asv.spec) %in% 
+c("Unknown", "uncultured", "Uncultured", "Unassigned", "NA"),] %>% t()
+
+#cor between feces dry matter + chemicals and taxa 
+chems <- as.matrix(chemdat[,c(1,12:34)])
+chems <- apply(chems, 2, function(x){log(1+x)})
+
+#and blood
+blood <- as.matrix(chemdat[, c(2:11)])
+blood <- apply(blood, 2, function(x){log(1+x)})
+
+#Corelation
+cor_main = Hmisc::rcorr(log_module, chems, type = "spearman")
+
+cor_chem_taxa = cor_main$r[rownames(cor_main$r) %in% colnames(chems) , colnames(cor_main$r) %in% colnames(log_module)] 
+
+cor_chem_taxa = cor_chem_taxa[complete.cases(cor_chem_taxa),]
+
+#Pvals
+
+cor.pval = cor_main$P[rownames(cor_main$P) %in% colnames(chems), colnames(cor_main$P) %in% colnames(log_module)] 
+
+cor.pval = cor.pval[complete.cases(cor.pval),]
+
+q_val <- apply(cor.pval, 2, function(x){p.adjust(x, method = "BH")})
+
+
+#checking for na
+any(is.na(q_val))
+
+df1 = melt(round(cor_chem_taxa, 2))
+df2 = melt(q_val)
+sigs <- left_join(df1, df2, by = c("Var1", "Var2")) %>% mutate(sigs = ifelse(value.y <= 0.05, value.x, "")) %>% dplyr::select(Var1, Var2, sigs) %>% pivot_wider(names_from = Var2, values_from = sigs) %>% data.frame() %>% column_to_rownames("Var1") %>% as.matrix() 
+colnames(sigs) = colnames(q_val)
+sigs <- t(sigs)
+
+#Plot 
+library(RColorBrewer)
+#Creating a biostringset
+cor_mat = t(as(cor_chem_taxa,"matrix"))#in the aassay dataset, we add our correlation matrix instead of the abundance matrix
+taxdat <- data.frame(tax_table(ps.spec)[rownames(ps.spec@tax_table) %in% rownames(cor_mat)])
+
+
+taxadat = Biobase::AnnotatedDataFrame(taxdat)#taxa table
+
+x = ExpressionSet(assayData = cor_mat,  featureData = taxadat  )
+
+
+
+
+#first we chose the top 100 most variable asvs in the dataset and define a function rowCenter that centers each asv by subtracting the mean acorss columns. 
+mat1 <-Biobase::exprs(x) 
+sds <- rowSds(mat1)
+o <- order(sds, decreasing = TRUE)
+h_1 <- hclust(dist(mat1[o,]), method = "ward.D2")#for column in this case
+h_2 <- hclust(dist(t(mat1[o,])), method = "ward.D2")
+
+#making a phylum annotation and it only accepts one column dataframe
+col.annot = fData(x)[rownames(fData(x)) %in% rownames(mat1[o,]),] %>% dplyr::select(Phylum, Genus)
+
+#making color index for the phylum annotation 
+
+phylcol=c('#fe0909', 'cyan','#297168', '#2c3836', 'cornflowerblue', 'plum4',
+          'darkgoldenrod3','aquamarine4', 'cadetblue2', 'red', 'darkblue', 'Maroon', 'Gray',
+        'steelblue2','darkmagenta', 'antiquewhite4', "darkorange", 'darkgreen')
+
+phyl.col = data.frame(Phylum = unique(col.annot[,1]), phyl.col = phylcol[1:5])
+
+phyl.col = column_to_rownames(phyl.col, "Phylum") %>% as.matrix
+
+#making a color index for the Genus annotation
+gen.col <- list(RColorBrewer::brewer.pal(7, name = "Set1"), RColorBrewer::brewer.pal(8, "Accent"), 
+     RColorBrewer::brewer.pal(8, "Dark2"), RColorBrewer::brewer.pal(8, "Set2")) %>% unlist
+
+genie <- data.frame(Genus = unique(taxdat$Genus), gen.col = gen.col)
+
+gencol <- c()
+
+for(i in unique(taxdat$Genus)){
+  gencol[i] <- genie[genie$Genus == i, "gen.col"]
+}
+
+#row color
+pathcol= c('#fe6600','cyan4','#b4b4b6', 'gold',
+            'cyan1')
+
+paths =unique(dss_modules_diff$Pathway)
+
+colindex = data.frame(color = pathcol[1:length(paths)], pathways = paths)
+
+colors.path = c()
+for(i in paths){
+  colors.path[i] = colindex[colindex$pathways == i,1]
+    }
+#row annot
+row.annot <- dss_modules_diff %>% select(modules, Pathway) %>% column_to_rownames("modules")
+
+
+#making sig table 
+df1 <- Biobase::exprs(x)[o,] %>% data.frame() %>% rownames_to_column("Species")
+
+df2 <- sigs[rownames(sigs) %in% 
+        rownames(t(Biobase::exprs(x)[o,])), ] %>% 
+        data.frame() %>% rownames_to_column("Species") 
+
+sig.df <- left_join(df1, df2, by = "Species")  %>% 
+dplyr::select(1,12:21) %>% column_to_rownames("Species")
+
+colnames(sig.df) <- colnames(sigs)
+sig.df <- t(sig.df)
+
+#color pallet for the heatmap
+pallet <- c("#24956e", "#faeaea", "#f45b03") 
+pallet <- c("#00d9ff", "#cac3c3", "#fbff00") 
+pallet <- c("#ffcc00", "#f1ebeb", "#048f63") #chemicals
+pallet <- c("#e8e6de", "#e2c4c4", "#ff0101") #blood
+pallet <- c("#e8e6de", "#e2c4c4", "#ff0101") #blood and module
+pal <- colorRampPalette(pallet)(9)
+
+
+#reordering the modlues and significant matrix based on the pathway alphabet
+mat <- cor_mat
+row.df <- row.annot %>% data.frame() %>% rownames_to_column("module")
+row.sorted <- row.df %>% group_by(Pathway) %>% arrange(.by_group = TRUE) %>% column_to_rownames("module") %>% as.matrix()
+
+mat <- mat[rownames(row.sorted),] 
+sigs <- sigs[rownames(mat), colnames(mat)]
+
+#Plot
+pheat_blood_taxa_dss = pheatmap(mat = mat, angle_col = 45,
+ legend_breaks = seq(from = -1, to = 1, 0.20), fontsize_row = 12,
+                      annotation_colors = list(
+                        #Phylum = phyl.col[,1] 
+                     # Genus = gencol, 
+                      Pathway = colors.path[order(names(colors.path))]
+                      ), #to reorder the pathways legend
+                      border_color = NA, 
+                      #annotation_col = col.annot%>% dplyr::select(1),
+                      annotation_row = data.frame(row.annot) %>% select(Pathway) %>% arrange(Pathway), 
+                      cellwidth = 22, cellheight = 20, cutree_cols = 4, cutree_rows = 4, number_color = "black",
+                      display_numbers = sigs, fontsize_number = 8,
+                      cluster_cols = F, 
+                      cluster_rows = F,
+                     # cluster_row = h_2, 
+                      col = pal,
+                      #col = RColorBrewer::brewer.pal(9, "Reds"), 
+                      main = "Heat map of spearman correlation 10 modules sig in dss with with chemicals")
+
+
+ggsave(plot = pheat_blood_taxa_dss, filename = "./outputs/heatmap/heatmap.module.chemicals.dss.main.jpeg", device = "jpeg", dpi = 300, height = 6, width = 18)
+```
+
+
+# 9. Visualizing the phylogenetic tree
+
+```{r, highlight_tree, fig.height = 10}
+library(phytools)
+library(TDbook)
+library(ggimage)
+library(treeio)
+
+
+
+spec.ps <- gloomer(pst.count, taxa_level = "Species")
+spec.rel <- transform_sample_counts(spec.ps, function(x){x/sum(x)*100})
+spec.rel <- prune_taxa(taxa_sums(spec.rel)>1, spec.rel)
+taxadf <- as.data.frame(tax_table(spec.rel))
+
+color.index <- c("#771155", "#AA4488", "#CC99BB", "#114477", "#4477AA", "#77AADD", "#117777", "#44AAAA", "#77CCCC", "#117744", "#44AA77", "#88CCAA", "#777711", "#AAAA44", "#DDDD77", "#774411", "#AA7744", "#DDAA77", "#771122", "#AA4455", "#DD7788")
+
+
+
+#creating a highlihgt df with a costum function
+
+
+mrca.wrap <- function(highlight, taxa.df, tree, tax_level="Phylum", type.id = "node"){
+
+taxa <- taxa.df %>% data.frame 
+node.id <- list()
+    
+for(i in phyls){
+  node.id[i] <- findMRCA(tree, tree$tip.label[taxa[,tax_level] == i], type = type.id) 
+    node.df <- data.frame(phyl = names(node.id), node.id = c(node.id[1][[1]]))
+}
+    node.id = node.id = as(node.id,"matrix")
+    node.df = data.frame(highlights = rownames(node.id), node.id = unlist(node.id))
+    return(node.df)
+    }
+
+phyls <- tax_table(pst.count)[rownames(tax_table(pst.count))%in% diff_spec_dss$genome, 2] %>% data.frame() %>%distinct() %>% pull()#chosoing phylum that dss differed their species
+
+node.df <- mrca.wrap(highlight = phyls, 
+taxa.df = tax_table(spec.rel), 
+tree = phy_tree(spec.rel), tax_level = "Phylum", 
+type = "node")
+
+#spceis highlihgt: those significantly differentiated by DSS
+specs <- unique(diff_spec_dss$Species)
+
+node_df_spec <- mrca.wrap(highlight = specs, 
+tree = phy_tree(spec.rel), 
+taxa.df = taxadf, 
+tax_level = "Species", 
+type.id = "tip")
+
+
+
+sub.spec <- subset_taxa(spec.rel, Species %in% specs)
+
+phyls <- tax_table(sub.spec)[,2] %>% data.frame %>%distinct %>% pull
+
+node.df <- mrca.wrap(highlight = phyl, 
+taxa.df = tax_table(sub.spec), 
+tree = phy_tree(sub.spec), tax_level = "Phylum", 
+type = "node")
+
+
+
+#drwing the tree
+plot_tree_circl <- ggtree(spec.rel, 
+#aes(color = Phylum),
+branch.length = "none",
+#size = 0.25, 
+#lwd = 0.5, 
+#cex = 0.8, 
+#layout = "roundrect", 
+layout = "circular",
+show.legend =FALSE,
+open.angle = 5
+)  +  
+geom_tiplab(aes(label=Species), 
+check.overlap = FALSE, 
+color = "black", 
+size = 2.25, 
+offset = 0.3,
+#align = TRUE
+) +  
+geom_tiplab(aes(subset = label %in% specs),
+ face = "bold", 
+ size = 2.25, 
+ offset =0.3, 
+ color = "red") +
+geom_cladelab(node = node.df$node.id, align = TRUE,
+label = node.df$highlights,
+ offset.text = 0.25, 
+ offset = 16,
+ barsize = 0.5, 
+ extend = 0.0001,
+ angle ="auto",
+ fontface = 2, size = 7) +
+#scale_color_manual(values = sample(color.index, 10, FALSE), breaks = unique(taxa$Phylum)) +#to remove the NA from the legend
+geom_highlight(data = node.df, 
+lwd = 0.25, lty = 3, color = "black", 
+aes(node = node.id, fill = highlights), 
+extend =0.05, to.bottom = FALSE, 
+align = "right", alpha = 0.4, show.legend = FALSE) +
+geom_nodepoint( pch = 21, color = "black", size = 2, fill = "white") + 
+geom_nodepoint(aes(subset = node %in% node.df$node.id), pch = 21, size = 3, color = "black", fill = "#00ffff") +
+geom_tippoint(aes(shape = as.factor(diar.score), color = diar.stat), size = 2) + 
+#geom_label(aes(x = branch, label = round(branch.length,2)),
+#label.padding = unit(0.05, "line"), size = 1.5, inherit.aes = TRUE) +
+scale_fill_manual(values =c("#ffee00",   "#005c28", "#fc00fc", "#00fc0d")) +
+scale_color_manual(values = c("#0981cc","#fc3b00")) + 
+labs(shape = "Diarrheal Score", color = "Diarrheal status")  
+#geom_treescale(color = "red", x=17,fontsize = 4, offset.label = -1, linesize = 0.5)
+
+ggsave(plot = plot_tree_circl, "./outputs/tree/Tree.species.circular2.jpeg", dpi = 500, height = 15, width = 15)
+
+
+
+
+
+#Now we can make a rectangular tree with other data added to it, i.e. abundance
+plot_tree_rect = ggtree(spec.rel, 
+branch.length = "none",
+#size = 0.25, 
+#lwd = 0.5, 
+ 
+#cex = 0.8, 
+#layout = "rect",
+)  +  
+geom_tiplab(#aes(label=Species), 
+color = "black",
+#align=TRUE,
+#linesize=.3, 
+size = 2.25, 
+#offset = 0.3
+) +
+#scale_color_manual(values = sample(color.index, 10, FALSE), breaks = unique(taxa$Phylum)) +#to remove the NA from the legend
+geom_highlight(data = node.df, 
+lwd = 0.5, lty = 2, color = "black", 
+aes(node = node.id, fill = highlights), 
+extend =0, to.bottom = FALSE, 
+align = "right", alpha = 0, show.legend = FALSE) +
+geom_nodepoint( pch = 21, color = "black", size = 2, fill = "white") + 
+geom_nodepoint(aes(subset = node == 234), pch = 21, size = 5, color = "black", fill = "#ff0000") +
+geom_tippoint(aes(shape = treatment, color = treatment), size = 2) +
+scale_fill_manual(values =c("#020202", "#ffee00",  "#771111",  "#fd0202", "#005c28",   "#fc00fc",  "#0026ff")) +
+labs(shape = "Treatment", color = "Treatment")
+
+#Discrete df for the phylum annotation
+taxa <- tax_table(spec.rel)
+df1 <- taxa[,c(2)]
+
+p1 <- gheatmap(p = plot_tree_rect, df1, offset =5, width=.04, colnames_offset_x = 0, 
+               colnames_angle=45, font.size = 2, colnames_offset_y = -.5, legend_title = "Phyla names") + 
+               scale_fill_viridis_d( option = "H", name = "Phyla names") 
+
+
+#making dataframe for abunance
+rel.df <- psmelt(spec.rel) %>% select(OTU, Abundance, treatment) %>% group_by( OTU, treatment) %>% summarise(rel = mean(Abundance), .groups = "drop")  %>% pivot_wider(values_from = "rel", id_cols = "OTU", names_from = "treatment") %>% column_to_rownames( "OTU")
+
+
+
+rescaled.reldf <- apply(rel.df, 2, function(x) {log(x+1)})
+
+
+#Continuous value for relative abundance
+library(ggnewscale)
+p2 <- p1 + new_scale_fill()
+p3 <- gheatmap(p2, font.size = 2, rescaled.reldf, offset=6.04, width=.08, 
+         colnames_angle=45, colnames_offset_y = -.5) +
+    scale_fill_viridis_c(option="C", name="Log relative abundance, %")
+
+ggsave(plot = p3, "./outputs/Tree.species.rect.jpeg", dpi = 300, height = 20, width = 15)
+```
+
+
